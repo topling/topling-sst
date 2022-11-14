@@ -114,7 +114,7 @@ ROCKSDB_RegTableFactoryMagicNumber(kSingleFastTableMagic, "SingleFastTable");
 #define GITHUB_TOPLING_SST "https://github.com/topling/topling-sst"
 // now GITHUB_TOPLING_ZIP is defined in toplingdb/Makefile
 // #define GITHUB_TOPLING_ZIP "https://github.com/rockeet/topling-core"
-void JS_RokcsDB_AddVersion(json& djs, bool html);
+void JS_RocksDB_AddVersion(json& djs, bool html);
 void JS_TopTable_AddVersion(json& djs, bool html) {
   auto& ver = djs["version"];
   if (html) {
@@ -147,7 +147,7 @@ void JS_TopTable_AddVersion(json& djs, bool html) {
     ver["topling-sst"] = git_version_hash_info_topling_sst();
     ver["topling-zip"] = git_version_hash_info_zbs(); // zbs depends on core
   }
-  JS_RokcsDB_AddVersion(ver["rocksdb"], html);
+  JS_RocksDB_AddVersion(ver["rocksdb"], html);
 }
 struct TopFastTableFactory_Json : TopFastTableFactory {
   void ToJson(json& djs, bool html) const {

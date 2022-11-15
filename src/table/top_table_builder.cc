@@ -160,7 +160,6 @@ void WriteFileFooter(uint64_t magic, const Slice& meta,
   BlockHandle metaHandle = WriteBlock(meta, file, offset);
   WriteBlockTrailer(meta, file, offset);
 #if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 60280
-  // fuck rocksdb 这帮傻逼
   // rocksdb-6.28 use format_version to check legacy format(0 means legacy),
   // but older rocksdb use IsLegacyFooterFormat(magic) to check legacy format.
   // so we set format_version = 1 to make both old and new rocksdb code happy.

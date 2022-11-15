@@ -54,7 +54,6 @@ template<class T>
 inline unique_ptr<T> UniquePtrOf(T* p) { return unique_ptr<T>(p); }
 
 #if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 60280
-// fuck rocksdb 这帮傻逼，吃饱了撑的乱改变量名
 const std::string kPropertiesBlock = "rocksdb.properties";
 const std::string kRangeDelBlock = "rocksdb.range_del";
 #endif

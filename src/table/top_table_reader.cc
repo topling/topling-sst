@@ -8,6 +8,7 @@
 #include <rocksdb/snapshot.h>
 #include <table/block_based/block.h>
 #include <table/meta_blocks.h>
+#include <terark/util/mmap.hpp>
 #include <terark/util/vm_util.hpp>
 
 #ifdef _MSC_VER
@@ -280,5 +281,114 @@ Status TopEmptyTableReader::Get(const ReadOptions&, const Slice&,
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+
+MmapReadWrapper::MmapReadWrapper(RandomAccessFileReader* reader, bool populate) {
+  target_ = reader->target();
+  const char* fname = reader->file_name().c_str();
+  int fd = (int)target_->FileDescriptor();
+  bool writable = false;
+  void* base = terark::mmap_load(fd, fname, &mmap_.size_, writable, populate);
+  mmap_.data_ = (const char*)base;
+  ROCKSDB_VERIFY_NE(base, nullptr);
+  ROCKSDB_VERIFY_EQ(mmap_.size_, terark::FileStream::fdsize(fd));
+}
+
+MmapReadWrapper::~MmapReadWrapper() {
+  if (mmap_.data_) {
+    terark::mmap_close((void*)mmap_.data_, mmap_.size_);
+  }
+  delete target_;
+}
+
+ptrdiff_t MmapReadWrapper::FileDescriptor() const {
+  ROCKSDB_DIE("Should not goes here");
+}
+
+IOStatus
+MmapReadWrapper::Read(uint64_t offset, size_t n, const IOOptions&,
+                      Slice* result, char*, IODebugContext*) const {
+  ROCKSDB_VERIFY_LE(offset, mmap_.size_);
+  ROCKSDB_VERIFY_LE(offset + n, mmap_.size_);
+  result->data_ = mmap_.data_ + offset;
+  result->size_ = n;
+  return IOStatus::OK();
+}
+
+void MmapAdvRnd(const void* addr, size_t len) {
+  size_t low = terark::align_up(size_t(addr), 4096);
+  size_t hig = terark::align_down(size_t(addr) + len, 4096);
+  if (low < hig) {
+    size_t size = hig - low;
+#ifdef POSIX_MADV_RANDOM
+    posix_madvise((void*)low, size, POSIX_MADV_RANDOM);
+#elif defined(_MSC_VER) // defined(_WIN32) || defined(_WIN64)
+    (void)size;
+#endif
+  }
+}
+
+void MmapAdvSeq(const void* addr, size_t len) {
+  size_t low = terark::align_up(size_t(addr), 4096);
+  size_t hig = terark::align_down(size_t(addr) + len, 4096);
+  if (low < hig) {
+    size_t size = hig - low;
+#ifdef POSIX_MADV_SEQUENTIAL
+    posix_madvise((void*)low, size, POSIX_MADV_SEQUENTIAL);
+#elif defined(_MSC_VER)  // defined(_WIN32) || defined(_WIN64)
+    (void)size;
+#endif
+  }
+}
+
+BlockContents ReadMetaBlockE(RandomAccessFileReader* file,
+                             uint64_t file_size,
+                             uint64_t table_magic_number,
+                             const ImmutableOptions& ioptions,
+                             const std::string& meta_block_name) {
+  FilePrefetchBuffer* prefetch_buffer = nullptr;
+#if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 60280
+  MemoryAllocator* compression_type_missing = nullptr;
+#else
+  bool compression_type_missing = true;
+#endif
+  BlockContents contents;
+  Status s = ReadMetaBlock(file, prefetch_buffer,
+        file_size, table_magic_number, ioptions,
+        meta_block_name, BlockType::kMetaIndex, &contents,
+        compression_type_missing);
+  if (!s.ok()) {
+    // when block is not found, Status is Corruption, it is a bad design of
+    // rocksdb, it makes our code which using ReadMetaBlockE more complex.
+    // we just handle it on caller side
+    throw s; // NOLINT
+  }
+  return contents;
+}
+
+std::unique_ptr<TableReader>
+OpenSST(const std::string& fname, uint64_t file_size,
+        const ImmutableOptions& ioptions) {
+  std::unique_ptr<TableReader> tr;
+  std::unique_ptr<FSRandomAccessFile> raf;
+  FileOptions fopt; //fopt.use_mmap_reads = true;
+  TableReaderOptions tro(ioptions, nullptr, fopt,
+                         ioptions.internal_comparator);
+  bool prefetch_index_and_filter_in_cache = false;
+  IODebugContext iodbg;
+  IOStatus s = ioptions.fs->NewRandomAccessFile(fname, fopt, &raf, &iodbg);
+  if (!s.ok()) {
+    throw s; // NOLINT
+  }
+  uint64_t fsize2 = FileStream::fdsize((int)raf->FileDescriptor());
+  TERARK_VERIFY_EQ(file_size, fsize2);
+  auto fr = UniquePtrOf(new RandomAccessFileReader(std::move(raf), fname));
+  auto st = ioptions.table_factory->NewTableReader(
+              ReadOptions(), tro, std::move(fr),
+              file_size, &tr, prefetch_index_and_filter_in_cache);
+  if (!st.ok()) {
+    throw st; // NOLINT
+  }
+  return tr;
+}
 
 } // namespace rocksdb

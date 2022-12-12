@@ -846,8 +846,6 @@ const {
 ROCKSDB_REG_Plugin("CSPPAutoSortTable", CSPPAutoSortTableFactory, TableFactory);
 ROCKSDB_RegTableFactoryMagicNumber(kCSPPAutoSortTableMagic, "CSPPAutoSortTable");
 
-void JS_TopTable_AddVersion(json& djs, bool html);
-
 std::string CSPPAutoSortTableFactory::ToString(const json &dump_options,
                                            const SidePluginRepo&) const {
   json djs;

@@ -1317,8 +1317,6 @@ const {
 ROCKSDB_REG_Plugin("VecAutoSortTable", VecAutoSortTableFactory, TableFactory);
 ROCKSDB_RegTableFactoryMagicNumber(kVecAutoSortTableMagic, "VecAutoSortTable");
 
-void JS_TopTable_AddVersion(json& djs, bool html);
-
 std::string VecAutoSortTableFactory::ToString(const json &dump_options,
                                            const SidePluginRepo&) const {
   json djs;
@@ -1370,6 +1368,7 @@ std::string VecAutoSortTableFactory::ToString(const json &dump_options,
   add_stats("FixedKey", fixed_key_stats);
   add_stats("FixedValue", fixed_value_stats);
   JS_TopTable_AddVersion(djs, html);
+  JS_ToplingDB_AddVersion(djs, html);
   return JsonToString(djs, dump_options);
 }
 

@@ -114,9 +114,7 @@ ROCKSDB_RegTableFactoryMagicNumber(kSingleFastTableMagic, "SingleFastTable");
 #define GITHUB_TOPLING_SST "https://github.com/topling/topling-sst"
 // now GITHUB_TOPLING_ZIP is defined in toplingdb/Makefile
 // #define GITHUB_TOPLING_ZIP "https://github.com/rockeet/topling-core"
-void JS_RocksDB_AddVersion(json& djs, bool html);
-void JS_TopTable_AddVersion(json& djs, bool html) {
-  auto& ver = djs["version"];
+void JS_TopTable_AddVersion(json& ver, bool html) {
   if (html) {
     std::string topling_sst = HtmlEscapeMin(strstr(git_version_hash_info_topling_sst(), "commit ") + strlen("commit "));
     std::string topling_zip = HtmlEscapeMin(strchr(git_version_hash_info_zbs(), ':') + 1);
@@ -147,7 +145,6 @@ void JS_TopTable_AddVersion(json& djs, bool html) {
     ver["topling-sst"] = git_version_hash_info_topling_sst();
     ver["topling-zip"] = git_version_hash_info_zbs(); // zbs depends on core
   }
-  JS_RocksDB_AddVersion(ver["rocksdb"], html);
 }
 struct TopFastTableFactory_Json : TopFastTableFactory {
   void ToJson(json& djs, bool html) const {
@@ -189,6 +186,7 @@ struct TopFastTableFactory_Json : TopFastTableFactory {
       { "write_speed_all.-seq", ToStr("%.3f MB/s", (sumlen - sum_user_key_cnt_ * 8) / td) },
     });
     JS_TopTable_AddVersion(djs, html);
+    JS_ToplingDB_AddVersion(djs, html);
   }
 };
 

@@ -33,6 +33,16 @@ namespace rocksdb {
 
 #define VERIFY_STATUS_OK(s) TERARK_VERIFY_F(s.ok(), "%s", s.ToString().c_str())
 
+#ifdef _MSC_VER
+#define TOPLING_SST_ASSUME(cond) __assume(cond)
+#elif defined(__clang__)
+#define TOPLING_SST_ASSUME(cond) __builtin_assume(cond)
+#elif defined(__GNUC__)
+#define TOPLING_SST_ASSUME(cond) ((cond) ? static_cast<void>(0) : __builtin_unreachable())
+#else
+#define TOPLING_SST_ASSUME(cond) static_cast<void>(!!(cond))
+#endif
+
 using std::string;
 using std::unique_ptr;
 
@@ -80,6 +90,7 @@ inline Slice SubSlice(const ByteArray& x, size_t pos, size_t len) {
 }
 
 inline uint64_t ReadBigEndianUint64(const void* beg, size_t len) {
+  TOPLING_SST_ASSUME(len <= 8);
   union {
     byte_t bytes[8];
     uint64_t value;

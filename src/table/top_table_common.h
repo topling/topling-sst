@@ -276,7 +276,8 @@ struct TableMultiPartInfo {
   struct KeyValueOffset {
     size_t offset;
     // {key,value,type} means corresponding length, not offset
-    size_t key;
+    size_t key : 63;
+    size_t main_single_del :  1;
     size_t value;
     size_t type;
     size_t type_histogram[4];

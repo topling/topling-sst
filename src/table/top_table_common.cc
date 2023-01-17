@@ -116,6 +116,7 @@ std::string GetFileNameByFD(intptr_t fd) {
 */
 
 size_t TableMultiPartInfo::calc_size(size_t prefixLen, size_t partCount) {
+  BOOST_STATIC_ASSERT(sizeof(KeyValueOffset) == 64);
   BOOST_STATIC_ASSERT(sizeof(KeyValueOffset) % 16 == 0);
   return terark::align_up(8
       + (partCount + 1) * sizeof(KeyValueOffset)

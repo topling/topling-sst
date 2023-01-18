@@ -37,7 +37,6 @@ public:
 };
 
 class TopTableReaderBase : public TableReader, boost::noncopyable {
-
 protected:
   std::unique_ptr<RandomAccessFileReader> file_;
   std::shared_ptr<TableProperties> table_properties_;
@@ -51,7 +50,6 @@ protected:
   Slice file_data_;
   bool isReverseBytewiseOrder_;
 
-protected:
   SequenceNumber GetSequenceNumber() const { return global_seqno_; }
   void LoadTombstone(RandomAccessFileReader* file, uint64_t file_size, uint64_t magic);
 

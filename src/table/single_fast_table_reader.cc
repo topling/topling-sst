@@ -30,9 +30,8 @@ static void PatriciaIterUnref(void* obj) {
 class SingleFastTableReader : public TopTableReaderBase {
 public:
   ~SingleFastTableReader() override;
-  explicit SingleFastTableReader(const TableReaderOptions& o)
-    : TopTableReaderBase(o), iter_cache_(&PatriciaIterUnref) {}
-  void Open(RandomAccessFileReader* file, Slice file_data, WarmupLevel);
+  explicit SingleFastTableReader() : iter_cache_(&PatriciaIterUnref) {}
+  void Open(RandomAccessFileReader*, Slice file_data, const TableReaderOptions&, WarmupLevel);
   InternalIterator*
   NewIterator(const ReadOptions&, const SliceTransform* prefix_extractor,
               Arena* arena, bool skip_filters, TableReaderCaller caller,
@@ -227,8 +226,14 @@ public:
   }
   void SetPinnedItersMgr(PinnedIteratorsManager*) final {}
   bool Valid() const final { return -1 != val_idx_; }
+  void SeekForPrevAux(const Slice& target, const InternalKeyComparator& c) {
+    SeekForPrevImpl(target, &c);
+  }
   void SeekForPrev(const Slice& target) final {
-    SeekForPrevImpl(target, &tab_->table_reader_options_.internal_comparator);
+    if (tab_->isReverseBytewiseOrder_)
+      SeekForPrevAux(target, InternalKeyComparator(ReverseBytewiseComparator()));
+    else
+      SeekForPrevAux(target, InternalKeyComparator(BytewiseComparator()));
   }
   void SetAtFirstValue() {
     auto entry = iter_->value_of<TopFastIndexEntry>();
@@ -536,11 +541,11 @@ std::string SingleFastTableReader::ToWebViewString(const json& dump_options) con
 /////////////////////////////////////////////////////////////////////////////
 
 void SingleFastTableReader::Open(RandomAccessFileReader* file, Slice file_data,
+                                 const TableReaderOptions& tro,
                                  WarmupLevel warmupLevel) {
   uint64_t file_size = file_data.size_;
-  auto& tro = table_reader_options_;
   try {
-    LoadCommonPart(file, file_data, kSingleFastTableMagic);
+    LoadCommonPart(file, tro, file_data, kSingleFastTableMagic);
   }
   catch (const Status&) { // very rare, try EmptyTable
     BlockContents emptyTableBC = ReadMetaBlockE(
@@ -550,9 +555,9 @@ void SingleFastTableReader::Open(RandomAccessFileReader* file, Slice file_data,
     INFO(tro.ioptions.info_log,
          "SingleFastTableReader::Open: %s is EmptyTable, it's ok\n",
          file->file_name().c_str());
-    auto t = UniquePtrOf(new TopEmptyTableReader(tro));
+    auto t = UniquePtrOf(new TopEmptyTableReader());
     file_.release(); // NOLINT
-    t->Open(file, file_data);
+    t->Open(file, file_data, tro);
     throw t.release(); // NOLINT
   }
   BlockContents indexBlock = ReadMetaBlockE(file, file_size,
@@ -610,9 +615,9 @@ const try {
     MmapAdvSeq(file_data);
     MmapWarmUp(file_data);
   }
-  auto t = new SingleFastTableReader(tro);
+  auto t = new SingleFastTableReader();
   table->reset(t);
-  t->Open(file.release(), file_data, table_options_.warmupLevel);
+  t->Open(file.release(), file_data, tro, table_options_.warmupLevel);
   as_atomic(num_readers_).fetch_add(1, std::memory_order_relaxed);
   return Status::OK();
 }

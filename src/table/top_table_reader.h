@@ -40,18 +40,17 @@ class TopTableReaderBase : public TableReader, boost::noncopyable {
 protected:
   std::unique_ptr<RandomAccessFileReader> file_;
   std::shared_ptr<TableProperties> table_properties_;
-  const TableReaderOptions table_reader_options_;
 #if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 70090
   std::shared_ptr<FragmentedRangeTombstoneList> fragmented_range_dels_;
 #else
   std::shared_ptr<const FragmentedRangeTombstoneList> fragmented_range_dels_;
 #endif
-  SequenceNumber global_seqno_;
+  SequenceNumber global_seqno_ = kDisableGlobalSequenceNumber;
   Slice file_data_;
-  bool isReverseBytewiseOrder_;
-
+  bool isReverseBytewiseOrder_ = false;
+  bool advise_random_on_open_ = false;
   SequenceNumber GetSequenceNumber() const { return global_seqno_; }
-  void LoadTombstone(RandomAccessFileReader* file, uint64_t file_size, uint64_t magic);
+  void LoadTombstone(RandomAccessFileReader*, const TableReaderOptions&, uint64_t file_size, uint64_t magic);
 
 public:
   FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(const ReadOptions&) override;
@@ -65,14 +64,9 @@ public:
   Status ApproximateKeyAnchors(const ReadOptions&, std::vector<Anchor>&) override;
 #endif
 
-  explicit TopTableReaderBase(const TableReaderOptions& o)
-    : table_reader_options_(o)
-    , global_seqno_(kDisableGlobalSequenceNumber)
-    , isReverseBytewiseOrder_(false)
-  {}
   ~TopTableReaderBase() override;
 
-  void LoadCommonPart(RandomAccessFileReader* file, Slice file_data, uint64_t magic);
+  void LoadCommonPart(RandomAccessFileReader*, const TableReaderOptions&, Slice file_data, uint64_t magic);
   virtual std::string ToWebViewString(const json& dump_options) const = 0;
 
   mutable ptrdiff_t cumu_iter_num_ = 0; // intentional public
@@ -97,8 +91,7 @@ public:
   uint64_t ApproximateOffsetOf(const Slice&, TableReaderCaller) override { return 0; }
   uint64_t ApproximateSize(const Slice&, const Slice&, TableReaderCaller) override { return 0; }
 
-  using TopTableReaderBase::TopTableReaderBase;
-  void Open(RandomAccessFileReader* file, Slice file_data);
+  void Open(RandomAccessFileReader*, Slice file_data, const TableReaderOptions&);
   std::string ToWebViewString(const json& dump_options) const override {
     return "TopEmptyTableReader";
   }

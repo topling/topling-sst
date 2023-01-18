@@ -119,13 +119,13 @@ Block* DetachBlockContents(BlockContents &tombstoneBlock, SequenceNumber global_
 }
 
 void TopTableReaderBase::
-LoadTombstone(RandomAccessFileReader* file, uint64_t file_size, uint64_t magic)
+LoadTombstone(RandomAccessFileReader* file, const TableReaderOptions& tro, uint64_t file_size, uint64_t magic)
 try {
   BlockContents tombstoneBlock = ReadMetaBlockE(file, file_size, magic,
-      table_reader_options_.ioptions,  kRangeDelBlock);
+      tro.ioptions,  kRangeDelBlock);
   TERARK_VERIFY(!tombstoneBlock.data.empty());
   auto  block = DetachBlockContents(tombstoneBlock, GetSequenceNumber());
-  auto& icomp = table_reader_options_.internal_comparator;
+  auto& icomp = tro.internal_comparator;
   auto* ucomp = icomp.user_comparator();
   auto  diter = UniquePtrOf(block->NewDataIterator(ucomp, global_seqno_));
   auto  delfn = [](void* arg0, void*) { delete static_cast<Block*>(arg0); };
@@ -147,8 +147,9 @@ TopTableReaderBase::NewRangeTombstoneIterator(const ReadOptions& ro) {
   if (ro.snapshot != nullptr) {
     snapshot = ro.snapshot->GetSequenceNumber();
   }
-  return new FragmentedRangeTombstoneIterator(fragmented_range_dels_,
-                        table_reader_options_.internal_comparator, snapshot);
+  InternalKeyComparator c(isReverseBytewiseOrder_ ?
+                          ReverseBytewiseComparator() : BytewiseComparator());
+  return new FragmentedRangeTombstoneIterator(fragmented_range_dels_, c, snapshot);
 }
 
 #if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 60280
@@ -168,11 +169,13 @@ Status ReadTableProperties(RandomAccessFileReader* file, uint64_t file_size,
 #endif
 
 void TopTableReaderBase::LoadCommonPart(RandomAccessFileReader* file,
-                                Slice file_data, uint64_t magic) {
+                                        const TableReaderOptions& tro,
+                                        Slice file_data, uint64_t magic) {
+  advise_random_on_open_ = tro.ioptions.advise_random_on_open;
   uint64_t file_size = file_data.size_;
   file_data_ = file_data;
   file_.reset(file); // take ownership
-  const auto& ioptions = table_reader_options_.ioptions;
+  const auto& ioptions = tro.ioptions;
   TableProperties* props = nullptr;
   Status s = ReadTableProperties(file, file_size, magic, ioptions, &props);
   if (!s.ok()) {
@@ -180,7 +183,7 @@ void TopTableReaderBase::LoadCommonPart(RandomAccessFileReader* file,
   }
   TERARK_VERIFY(nullptr != props);
   table_properties_.reset(props);
-  //TERARK_VERIFY(table_reader_options_.env_options.use_mmap_reads);
+  //TERARK_VERIFY(tro.env_options.use_mmap_reads);
 
 // verify comparator
   TERARK_VERIFY_F(IsBytewiseComparator(ioptions.user_comparator),
@@ -194,19 +197,19 @@ void TopTableReaderBase::LoadCommonPart(RandomAccessFileReader* file,
       "Invalid user_comparator , need " + props->comparator_name
       + ", but provide " + ioptions.user_comparator->Name());
   }
-  TERARK_VERIFY_EQ(table_reader_options_.internal_comparator.user_comparator(),
-                   table_reader_options_.ioptions.user_comparator);
+  TERARK_VERIFY_EQ(tro.internal_comparator.user_comparator(),
+                   tro.ioptions.user_comparator);
 // verify comparator end
 
   isReverseBytewiseOrder_ = !IsForwardBytewiseComparator(ioptions.user_comparator);
-  GetGlobalSequenceNumber(*props, table_reader_options_.largest_seqno, &global_seqno_);
+  GetGlobalSequenceNumber(*props, tro.largest_seqno, &global_seqno_);
   if (global_seqno_ >= kMaxSequenceNumber) {
     global_seqno_ = 0;
   }
   Debug(ioptions.info_log,
        "TopTableReaderBase::LoadCommonPart(%s): global_seqno = %" PRIu64,
        file->file_name().c_str(), global_seqno_);
-  LoadTombstone(file, file_size, magic);
+  LoadTombstone(file, tro, file_size, magic);
 }
 
 TopTableReaderBase::~TopTableReaderBase() {
@@ -241,10 +244,10 @@ ApproximateKeyAnchors(const ReadOptions&, std::vector<Anchor>& anchors) {
 
 ///////////////////////////////////////////////////////////////////////////////
 void
-TopEmptyTableReader::Open(RandomAccessFileReader* file, Slice file_data) {
-  LoadCommonPart(file, file_data, kTopEmptyTableMagicNumber);
+TopEmptyTableReader::Open(RandomAccessFileReader* file, Slice file_data, const TableReaderOptions& tro) {
+  LoadCommonPart(file, tro, file_data, kTopEmptyTableMagicNumber);
   auto props = table_properties_.get();
-  ROCKS_LOG_DEBUG(table_reader_options_.ioptions.info_log
+  ROCKS_LOG_DEBUG(tro.ioptions.info_log
     , "TopEmptyTableReader::Open(%s): fsize = %zd, entries = %zd keys = 0 indexSize = 0 valueSize = 0, warm up time = 0.000'sec, build cache time =      0.000'sec\n"
     , file->file_name().c_str()
     , size_t(file_data.size_), size_t(props->num_entries)

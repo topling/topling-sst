@@ -400,7 +400,7 @@ class CSPPAutoSortTableReader : public TopTableReaderBase {
 public:
   using TopTableReaderBase::TopTableReaderBase;
   ~CSPPAutoSortTableReader() override;
-  void Open(RandomAccessFileReader* file, Slice file_data);
+  void Open(RandomAccessFileReader*, Slice file_data, const TableReaderOptions&);
   InternalIterator*
   NewIterator(const ReadOptions&, const SliceTransform* prefix_extractor,
               Arena* arena, bool skip_filters, TableReaderCaller caller,
@@ -552,8 +552,14 @@ public:
   }
   void SetPinnedItersMgr(PinnedIteratorsManager*) final {}
   bool Valid() const final { return is_valid_; }
+  void SeekForPrevAux(const Slice& target, const InternalKeyComparator& c) {
+    SeekForPrevImpl(target, &c);
+  }
   void SeekForPrev(const Slice& target) final {
-    SeekForPrevImpl(target, &tab_->table_reader_options_.internal_comparator);
+    if (tab_->isReverseBytewiseOrder_)
+      SeekForPrevAux(target, InternalKeyComparator(ReverseBytewiseComparator()));
+    else
+      SeekForPrevAux(target, InternalKeyComparator(BytewiseComparator()));
   }
   Slice key() const final {
     assert(is_valid_);
@@ -718,11 +724,10 @@ std::string CSPPAutoSortTableReader::ToWebViewString(const json& dump_options) c
 
 /////////////////////////////////////////////////////////////////////////////
 
-void CSPPAutoSortTableReader::Open(RandomAccessFileReader* file, Slice file_data) {
+void CSPPAutoSortTableReader::Open(RandomAccessFileReader* file, Slice file_data, const TableReaderOptions& tro) {
   uint64_t file_size = file_data.size_;
-  auto& tro = table_reader_options_;
   try {
-    LoadCommonPart(file, file_data, kCSPPAutoSortTableMagic);
+    LoadCommonPart(file, tro, file_data, kCSPPAutoSortTableMagic);
   }
   catch (const Status&) { // very rare, try EmptyTable
     BlockContents emptyTableBC = ReadMetaBlockE(
@@ -732,9 +737,9 @@ void CSPPAutoSortTableReader::Open(RandomAccessFileReader* file, Slice file_data
     INFO(tro.ioptions.info_log,
          "CSPPAutoSortTableReader::Open: %s is EmptyTable, it's ok\n",
          file->file_name().c_str());
-    auto t = UniquePtrOf(new TopEmptyTableReader(tro));
+    auto t = UniquePtrOf(new TopEmptyTableReader());
     file_.release(); // NOLINT
-    t->Open(file, file_data);
+    t->Open(file, file_data, tro);
     throw t.release(); // NOLINT
   }
   BlockContents indexBlock = ReadMetaBlockE(file, file_size,
@@ -790,9 +795,9 @@ const try {
   }
   MmapAdvSeq(file_data);
 //MmapWarmUp(file_data);
-  auto t = new CSPPAutoSortTableReader(tro);
+  auto t = new CSPPAutoSortTableReader();
   table->reset(t);
-  t->Open(file.release(), file_data);
+  t->Open(file.release(), file_data, tro);
   as_atomic(num_readers_).fetch_add(1, std::memory_order_relaxed);
   return Status::OK();
 }

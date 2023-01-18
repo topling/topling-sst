@@ -810,4 +810,24 @@ catch (TopEmptyTableReader* t) { // NOLINT
   return Status::OK();
 }
 
+///////////////////////////////////////////////////////////////////////////
+struct TopTableReader_Manip : PluginManipFunc<TableReader> {
+  void Update(TableReader*, const json&, const json& js,
+              const SidePluginRepo& repo) const final {
+    THROW_NotSupported("Reader is read only");
+  }
+  std::string ToString(const TableReader& reader, const json& dump_options,
+                       const SidePluginRepo& repo) const final {
+    if (auto rd = dynamic_cast<const TopTableReaderBase*>(&reader)) {
+      return rd->ToWebViewString(dump_options);
+    }
+    THROW_InvalidArgument("Unknow TableReader");
+  }
+};
+// Register as compression algo name
+ROCKSDB_REG_PluginManip("TooZip", TopTableReader_Manip);
+ROCKSDB_REG_PluginManip("TooFast", TopTableReader_Manip);
+ROCKSDB_REG_PluginManip("SngFast", TopTableReader_Manip);
+
+
 } // ROCKSDB_NAMESPACE

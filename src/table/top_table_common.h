@@ -278,8 +278,15 @@ struct TableMultiPartInfo {
     // {key,value,type} means corresponding length, not offset
     size_t key;
     size_t value;
-    size_t type;
-    size_t type_histogram[4];
+    size_t type        : 56;
+    size_t tag_rs_kind :  8;
+    union {
+      size_t type_histogram[4];
+      struct {
+        size_t tag_num;  ///< non-zero tag num
+        size_t rs_bytes; ///< there is only one rank-select
+      };
+    };
   };
   valvec<KeyValueOffset> offset_;
   terark::FixedLenStrVec prefixSet_;

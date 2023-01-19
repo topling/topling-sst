@@ -46,6 +46,7 @@ BlockHandle WriteBlock(const ByteArray& data, WritableFileWriter* file, uint64_t
   *offset += data.size();
   return BlockHandle(old_offset, data.size());
 }
-void WriteFileFooter(uint64_t magic, const Slice& meta,  WritableFileWriter*, uint64_t* offset);
+void WriteFileFooter(uint64_t magic, uint32_t version, const Slice& meta,
+                     WritableFileWriter*, uint64_t* offset);
 
 } // namespace rocksdb

@@ -123,7 +123,8 @@ void TopTableBuilderBase::WriteMeta(uint64_t magic,
     metaindexBuilder.Add(kRangeDelBlock,
                         WriteBlock(range_del_block_.Finish(), file_, &offset_));
   }
-  WriteFileFooter(magic, metaindexBuilder.Finish(), file_, &offset_);
+  uint32_t version = 1;
+  WriteFileFooter(magic, version, metaindexBuilder.Finish(), file_, &offset_);
 }
 
 void TopTableBuilderBase::FinishAsEmptyTable() {
@@ -155,15 +156,15 @@ void WriteBlockTrailer(const Slice& block, WritableFileWriter* file, uint64_t* o
   WriteBlock(Slice(trailer, kBlockTrailerSize), file, offset);
 }
 
-void WriteFileFooter(uint64_t magic, const Slice& meta,
+void WriteFileFooter(uint64_t magic, uint32_t format_version, const Slice& meta,
                      WritableFileWriter* file, uint64_t* offset) {
   BlockHandle metaHandle = WriteBlock(meta, file, offset);
   WriteBlockTrailer(meta, file, offset);
 #if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 60280
   // rocksdb-6.28 use format_version to check legacy format(0 means legacy),
   // but older rocksdb use IsLegacyFooterFormat(magic) to check legacy format.
-  // so we set format_version = 1 to make both old and new rocksdb code happy.
-  uint32_t format_version = 1; // our sst does not check format_version
+  // so we set format_version >= 1 to make both old and new rocksdb code happy.
+  ROCKSDB_VERIFY_GE(format_version, 1);
   FooterBuilder footer;
   footer.Build(magic, format_version, *offset, kxxHash, metaHandle);
   WriteBlock(footer.GetSlice(), file, offset);

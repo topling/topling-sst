@@ -427,7 +427,6 @@ public:
   size_t index_size_;
   int fixed_value_len_;
   bool enableIndexRank_;
-  Cleanable noop_pinner_;
 
   class Iter;
   class BaseIter;
@@ -503,8 +502,9 @@ Status CSPPAutoSortTableReader::Get(const ReadOptions& read_options,
         if (kTypeMerge == pikey.type)
           pikey.type = kTypeValue; // instruct SaveValue to stop earlier
       }
+      Cleanable noop_pinner;
       bool matched;
-      get_context->SaveValue(pikey, val, &matched, &noop_pinner_);
+      get_context->SaveValue(pikey, val, &matched, &noop_pinner);
     }
   }
   return Status::OK();

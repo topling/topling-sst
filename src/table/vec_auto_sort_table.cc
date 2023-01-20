@@ -762,7 +762,6 @@ public:
   int fixed_value_len_ = -1; // -1 means var len
   uint32_t pref_len_;
   const MetaInfo* sstmeta_;
-  Cleanable noop_pinner_;
 
   class Iter;
   class BaseIter;
@@ -827,6 +826,7 @@ Status VecAutoSortTableReader::Get(const ReadOptions& ro,
     fstring suffix = fstring(pikey.user_key).substr(pref_len_);
     Slice val;
     bool matched;
+    Cleanable noop_pinner;
     if (fixed_key_len_) {
       if (ikey.size_ != size_t(fixed_key_len_)) {
         return st;
@@ -845,7 +845,7 @@ memcmp(fstrvec_.nth_data(lo), suffix.data(), suffix.size()) == 0) {
             val.size_ = fixed_value_len_;
           }
         }
-        get_context->SaveValue(pikey, val, &matched, &noop_pinner_);
+        get_context->SaveValue(pikey, val, &matched, &noop_pinner);
       }
     }
     else { // 0 == fixed_key_len_
@@ -856,7 +856,7 @@ memcmp(fstrvec_.nth_data(lo), suffix.data(), suffix.size()) == 0) {
             val.data_ = file_data_.data_ + fixed_value_len_ * lo;
             val.size_ = fixed_value_len_;
           }
-          get_context->SaveValue(pikey, val, &matched, &noop_pinner_);
+          get_context->SaveValue(pikey, val, &matched, &noop_pinner);
         }
       } else { // fixed_value_len_ < 0
         size_t lo = vkvv_.lower_bound(suffix);
@@ -864,7 +864,7 @@ memcmp(fstrvec_.nth_data(lo), suffix.data(), suffix.size()) == 0) {
           if (!ro.just_check_key_exists) {
             val = SliceOf(vkvv_.val(lo));
           }
-          get_context->SaveValue(pikey, val, &matched, &noop_pinner_);
+          get_context->SaveValue(pikey, val, &matched, &noop_pinner);
         }
       }
     }

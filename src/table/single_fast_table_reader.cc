@@ -337,6 +337,17 @@ public:
   Status status() const final { return Status::OK(); }
   bool IsKeyPinned() const final { return false; }
   bool IsValuePinned() const final { return true; }
+
+  bool NextAndGetResult(IterateResult* result) noexcept final {
+    Next();
+    if (-1 != val_idx_) { // this->Valid()
+      result->key = this->key();
+      result->bound_check_result = IterBoundCheck::kUnknown;
+      result->value_prepared = true;
+      return true;
+    }
+    return false;
+  }
 };
 class SingleFastTableReader::Iter : public BaseIter {
 public:

@@ -1308,10 +1308,6 @@ Status
 VecAutoSortTableFactory::ValidateOptions(const DBOptions& db_opts,
                                       const ColumnFamilyOptions& cf_opts)
 const {
-  if (!db_opts.allow_mmap_reads) {
-    return Status::InvalidArgument(ROCKSDB_FUNC,
-                                   "allow_mmap_reads must be true");
-  }
   if (!IsBytewiseComparator(cf_opts.comparator)) {
     return Status::InvalidArgument(ROCKSDB_FUNC, "comparator is not bytewise");
   }

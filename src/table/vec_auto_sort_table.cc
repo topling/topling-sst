@@ -1031,7 +1031,7 @@ public:
     TERARK_ASSERT_BT(idx_, 0, num_);
     Next();
     if (this->Valid()) {
-      result->key = this->key();
+      result->SetKey(this->key());
       result->bound_check_result = IterBoundCheck::kUnknown;
       result->value_prepared = true;
       return true;
@@ -1103,7 +1103,7 @@ public:
     TERARK_ASSERT_BT(idx_, 0, num_);
     Next();
     if (this->Valid()) {
-      result->key = this->key();
+      result->SetKey(this->key());
       result->bound_check_result = IterBoundCheck::kUnknown;
       result->value_prepared = true;
       return true;

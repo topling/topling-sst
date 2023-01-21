@@ -341,7 +341,7 @@ public:
   bool NextAndGetResult(IterateResult* result) noexcept final {
     Next();
     if (-1 != val_idx_) { // this->Valid()
-      result->key = this->key();
+      result->SetKey(this->key());
       result->bound_check_result = IterBoundCheck::kUnknown;
       result->value_prepared = true;
       return true;

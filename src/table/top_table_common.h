@@ -283,8 +283,12 @@ struct TableMultiPartInfo {
     union {
       size_t type_histogram[4];
       struct {
-        size_t tag_num;  ///< non-zero tag num
         size_t rs_bytes; ///< there is only one rank-select
+        size_t tag_bytes;
+        size_t tag_num   : 48;  ///< non-zero tag num
+        size_t vtr_num   :  8;
+        size_t seq_width :  8;
+        size_t min_seq;
       };
     };
   };

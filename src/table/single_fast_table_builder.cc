@@ -286,7 +286,7 @@ Status SingleFastTableBuilder::Finish() try {
   properties_.data_size  = indexOffset;
   properties_.num_data_blocks = 1;
   if (max_key_len == min_key_len) {
-    properties_.fixed_key_len = max_key_len;
+    properties_.fixed_key_len = max_key_len + 8; // InternalKey Len
   }
   if (max_val_len == min_val_len) {
     properties_.fixed_value_len = max_val_len;

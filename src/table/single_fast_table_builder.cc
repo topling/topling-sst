@@ -257,7 +257,10 @@ void SingleFastTableBuilder::DoWriteAppend(const void* data, size_t size) {
 terark_forceinline
 void SingleFastTableBuilder::WriteValue(uint64_t seqvt, const Slice& value) {
   valueNodeVec_.push_back({offset_, seqvt});
-  DoWriteAppend(value.data_, value.size_);
+  if (value.size_)
+    DoWriteAppend(value.data_, value.size_);
+  else
+    DoWriteAppend("\0", 1);
 }
 
 const uint64_t kSingleFastTableMagic = 0x747361466c676e53; // SnglFast

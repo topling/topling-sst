@@ -124,17 +124,17 @@ void JS_TopTable_AddVersion(json& ver, bool html) {
     auto topling_zip_sha_end = std::find_if(topling_zip.begin(), topling_zip.end(), &isspace);
     terark::string_appender<> oss_sst, oss_zip;
     oss_sst|"<pre>"
-             |"<a href='"|GITHUB_TOPLING_SST|"/commit/"
-             |headstr(topling_sst, topling_sst_sha_end)|"'>"
-             |headstr(topling_sst, topling_sst_sha_end)|"</a>"
-             |tailstr(topling_sst, topling_sst_sha_end)
-             |"</pre>";
-    oss_zip |"<pre>"
-             |"<a href='"|GITHUB_TOPLING_ZIP|"/commit/"
-             |headstr(topling_zip, topling_zip_sha_end)|"'>"
-             |headstr(topling_zip, topling_zip_sha_end)|"</a>"
-             |tailstr(topling_zip, topling_zip_sha_end)
-             |"</pre>";
+           |"<a href='"|GITHUB_TOPLING_SST|"/commit/"
+           |headstr(topling_sst, topling_sst_sha_end)|"'>"
+           |headstr(topling_sst, topling_sst_sha_end)|"</a>"
+           |tailstr(topling_sst, topling_sst_sha_end)
+           |"</pre>";
+    oss_zip|"<pre>"
+           |"<a href='"|GITHUB_TOPLING_ZIP|"/commit/"
+           |headstr(topling_zip, topling_zip_sha_end)|"'>"
+           |headstr(topling_zip, topling_zip_sha_end)|"</a>"
+           |tailstr(topling_zip, topling_zip_sha_end)
+           |"</pre>";
     ver["topling-sst"] = static_cast<std::string&&>(oss_sst);
     ver["topling-zip"] = static_cast<std::string&&>(oss_zip);
   } else {

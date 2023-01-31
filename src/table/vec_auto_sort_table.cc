@@ -638,6 +638,30 @@ void VecAutoSortTableBuilder::DebugCheckTable() {
     idx++;
   }
   TERARK_VERIFY_EQ(idx, num);
+  it->SeekToLast();
+  TERARK_VERIFY_S(it->Valid(), "status = %s", it->status().ToString());
+  idx = num;
+  while (it->Valid()) { // reverse iterate check
+    idx--;
+    TERARK_VERIFY_LT(idx, num);
+    TERARK_VERIFY_S(kv_debug_[idx].first == it->user_key(), " %s <=> %s",
+                hex(kv_debug_[idx].first), hex(it->user_key()));
+    TERARK_VERIFY_S(kv_debug_[idx].second == it->value(), " %s <=> %s",
+                hex(kv_debug_[idx].second), hex(it->value()));
+    it->Prev();
+  }
+  for (idx = 0; idx < num; idx++) { // Seek check
+    Slice uk = kv_debug_[idx].first;
+    it->Seek(uk + Slice("\0\0\0\0\0\0\0\0", 8));
+    TERARK_VERIFY_S(it->Valid(), "%zd/%zd : %s", idx, num, hex(uk));
+    TERARK_VERIFY_S(kv_debug_[idx].first == it->user_key(), " %s <=> %s",
+                hex(kv_debug_[idx].first), hex(it->user_key()));
+    TERARK_VERIFY_S(kv_debug_[idx].second == it->value(), " %s <=> %s",
+                hex(kv_debug_[idx].second), hex(it->value()));
+  }
+  STD_INFO("VecAutoSortTableBuilder::DebugCheckTable(%s) success!",
+           file_->file_name().c_str());
+
   delete it;
 }
 

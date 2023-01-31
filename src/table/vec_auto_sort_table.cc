@@ -60,6 +60,7 @@ public:
   bool SupportAutoSort() const final { return true; }
 
   size_t fileWriteBufferSize = 32*1024;
+  ushort minUserKeyLen = 0; // now just used for runtime verify
   bool forceNeedCompact = true;
   bool collectProperties = true;
   int debugLevel = 0;
@@ -129,6 +130,7 @@ public:
   valvec<byte_t> strvec_;
   AutoGrownMemIO lenbuf_;
   int debugLevel_;
+  ushort minUserKeyLen_;
   uint32_t min_key_len_ = UINT32_MAX, max_key_len_ = 0;
   uint32_t min_val_len_ = UINT32_MAX, max_val_len_ = 0;
   valvec<byte_t> min_ukey_, max_ukey_;
@@ -266,6 +268,7 @@ VecAutoSortTableBuilder::VecAutoSortTableBuilder(
 {
   properties_.compression_name = "VecAutoSort";
   debugLevel_ = table_factory->debugLevel;
+  minUserKeyLen_ = table_factory->minUserKeyLen;
   int fd = (int)file->writable_file()->FileDescriptor();
   TERARK_VERIFY_GE(fd, 0);
   fstream_.attach(fd);
@@ -281,12 +284,12 @@ void VecAutoSortTableBuilder::Add(const Slice& key, const Slice& value) {
   properties_.num_entries++;
   const uint64_t seqvt = DecodeFixed64(key.data() + key.size() - 8);
   const auto vt = ValueType(seqvt & 255u);
-  TERARK_ASSERT_EZ((vt & 0x80u));
   if (LIKELY(kTypeValue == vt)) {
     TERARK_ASSERT_GE(key.size(), 8);
     minimize(min_key_len_, key.size_); minimize(min_val_len_, value.size_);
     maximize(max_key_len_, key.size_); maximize(max_val_len_, value.size_);
     fstring ukey(key.data_, key.size_ - 8);
+    TERARK_VERIFY_GE(ukey.size(), minUserKeyLen_);
     if (LIKELY(num_user_key_)) {
       if (false) {}
       else if (ukey < min_ukey_) min_ukey_.assign(ukey);
@@ -675,7 +678,7 @@ const {
 
 class VecAutoSortTableReader : public TopTableReaderBase {
 public:
-  VecAutoSortTableReader() {}
+  VecAutoSortTableReader(const VecAutoSortTableFactory* f) : factory_(f) {}
   ~VecAutoSortTableReader() override;
   void Open(RandomAccessFileReader*, Slice file_data, const TableReaderOptions&);
   InternalIterator*
@@ -762,6 +765,7 @@ public:
   int fixed_value_len_ = -1; // -1 means var len
   uint32_t pref_len_;
   const MetaInfo* sstmeta_;
+  const VecAutoSortTableFactory* factory_;
 
   class Iter;
   class BaseIter;
@@ -885,6 +889,7 @@ public:
   int fixed_key_len_;
   int fixed_value_len_;
   uint32_t pref_len_;
+  uint16_t minUserKeyLen_;
   bool isReverseBytewiseOrder_;
   int num_;
   int idx_;
@@ -897,6 +902,7 @@ public:
     fixed_key_len_ = table->fixed_key_len_;
     fixed_value_len_ = table->fixed_value_len_;
     pref_len_ = table->pref_len_;
+    minUserKeyLen_ = table->factory_->minUserKeyLen;
     isReverseBytewiseOrder_ = table->isReverseBytewiseOrder_;
     num_ = table->table_properties_->num_entries;
     idx_ = -1;
@@ -913,6 +919,7 @@ public:
   void SetSeqVT(bool is_valid) {
     if (is_valid) {
       auto suffix = tab_->GetKey(idx_);
+      TERARK_VERIFY_GE(pref_len_ + suffix.size(), minUserKeyLen_);
       memcpy(ikey_buf_ + pref_len_, suffix.data(), suffix.size());
       ikey_len_ = pref_len_ + suffix.size() + 8;
       uint64_t seqvt = PackSequenceAndType(global_seqno_, kTypeValue);
@@ -932,6 +939,7 @@ public:
   }
   Slice key() const final {
     TERARK_ASSERT_BT(idx_, 0, num_);
+    TERARK_ASSERT_GE(ikey_len_, minUserKeyLen_);
     return Slice(ikey_buf_, ikey_len_);
   }
   Slice user_key() const final {
@@ -1265,7 +1273,7 @@ const try {
   }
   MmapAdvSeq(file_data);
 //MmapWarmUp(file_data);
-  auto t = new VecAutoSortTableReader();
+  auto t = new VecAutoSortTableReader(this);
   table->reset(t);
   t->Open(file.release(), file_data, tro);
   as_atomic(num_readers_).fetch_add(1, std::memory_order_relaxed);
@@ -1294,6 +1302,7 @@ void VecAutoSortTableFactory::Update(const json&, const json& js, const SidePlug
   ROCKSDB_JSON_OPT_PROP(js, collectProperties);
   ROCKSDB_JSON_OPT_PROP(js, forceNeedCompact);
   ROCKSDB_JSON_OPT_PROP(js, debugLevel);
+  ROCKSDB_JSON_OPT_PROP(js, minUserKeyLen);
 }
 
 VecAutoSortTableFactory::~VecAutoSortTableFactory() { // NOLINT

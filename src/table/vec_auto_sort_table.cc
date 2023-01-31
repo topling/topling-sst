@@ -133,6 +133,7 @@ public:
   ushort minUserKeyLen_;
   uint32_t min_key_len_ = UINT32_MAX, max_key_len_ = 0;
   uint32_t min_val_len_ = UINT32_MAX, max_val_len_ = 0;
+  size_t num_asc_ = 0, num_dsc_ = 0;
   valvec<byte_t> min_ukey_, max_ukey_;
   OsFileStream fstream_;
   OutputBuffer fobuf_;
@@ -292,8 +293,8 @@ void VecAutoSortTableBuilder::Add(const Slice& key, const Slice& value) {
     TERARK_VERIFY_GE(ukey.size(), minUserKeyLen_);
     if (LIKELY(num_user_key_)) {
       if (false) {}
-      else if (ukey < min_ukey_) min_ukey_.assign(ukey);
-      else if (ukey > max_ukey_) max_ukey_.assign(ukey);
+      else if (ukey < min_ukey_) min_ukey_.assign(ukey), num_dsc_++;
+      else if (ukey > max_ukey_) max_ukey_.assign(ukey), num_asc_++;
     } else {
       min_ukey_.assign(ukey);
       max_ukey_.assign(ukey);
@@ -459,7 +460,13 @@ Status VecAutoSortTableBuilder::Finish() try {
       TERARK_VERIFY_EQ(strvec_.size(), kvfixlen * num);
       fstrvec.m_fixlen = kvfixlen;
       fstrvec.m_strpool.swap(strvec_);
-      fstrvec.sort(valfixlen);
+      if (num_asc_ + 1 == num) { // input is foward bytewise sorted
+        fstrvec.sort(valfixlen); // TODO: omit sort and test
+      } else if (num_dsc_ + 1 == num) { // input is reverse bytewise sorted
+        fstrvec.sort(valfixlen); // TODO: just reverse
+      } else { // need sort
+        fstrvec.sort(valfixlen);
+      }
       auto base_valptr = (const char*)fstrvec.m_strpool.data() + ukeyfixlen;
       auto getval = [=](size_t idx) {
         ROCKSDB_ASSERT_LT(idx, num);

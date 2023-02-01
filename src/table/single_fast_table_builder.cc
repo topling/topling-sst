@@ -297,7 +297,6 @@ Status SingleFastTableBuilder::Finish() try {
 //------ NotifyCollectTableCollectorsOnAdd(...)
 // Same as SingleFastTableReader::ApproximateOffsetOf()
   auto iter = cspp_.new_iter();
-  iter->seek_begin();
   double approximateFileSize = offset_ + 500;
   double coefficient = approximateFileSize / (indexOffset + 1.0);
   auto log = ioptions_.info_log.get();
@@ -309,6 +308,11 @@ Status SingleFastTableBuilder::Finish() try {
     uint64_t fakeOffset = valuePos * coefficient;
     NotifyCollectTableCollectorsOnAdd(ikey, value, fakeOffset, collectors_, log);
   };
+  const bool isReverse = isReverseBytewiseOrder_; // help compiler optimzer
+  if (isReverse)
+    TERARK_VERIFY(iter->seek_end());
+  else
+    TERARK_VERIFY(iter->seek_begin());
   do {
     auto entry = iter->value_of<TopFastIndexEntry>();
     if (entry.valueMul) {
@@ -323,7 +327,7 @@ Status SingleFastTableBuilder::Finish() try {
     } else {
       collect(entry.seqvt, entry.valuePos, entry.valueLen);
     }
-  } while (iter->incr());
+  } while (isReverse ? iter->decr() : iter->incr());
   iter->dispose();
 //-------------------------------------------------------------------------
 

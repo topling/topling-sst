@@ -19,6 +19,7 @@ protected:
   BlockBuilder range_del_block_;
   bool closed_ = false;  // Either Finish() or Abandon() has been called.
   bool isReverseBytewiseOrder_;
+  signed char debugLevel_ = 0;
 
   TopTableBuilderBase(const TableBuilderOptions& tbo, WritableFileWriter* file);
 

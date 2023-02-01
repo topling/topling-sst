@@ -53,6 +53,7 @@ public:
     uint64_t seqvt;
   };
   valvec<ValueNode> valueNodeVec_; // of same user key
+  size_t prev_value_len_ = 0;
   size_t max_key_len = 0, min_key_len = SIZE_MAX;
   size_t max_val_len = 0, min_val_len = SIZE_MAX;
   MainPatricia cspp_;
@@ -78,6 +79,7 @@ SingleFastTableBuilder::SingleFastTableBuilder(
   : TopTableBuilderBase(tbo, file), table_factory_(table_factory)
   , cspp_(IndexEntrySize, 2u<<20u, Patricia::SingleThreadStrict)
 {
+  debugLevel_ = (signed char)table_factory->table_options_.debugLevel;
   properties_.compression_name = "SngFast";
   writeMethod_ = table_factory->table_options_.writeMethod;
   if (WriteMethod::kToplingMmapWrite == writeMethod_) {
@@ -216,12 +218,14 @@ void SingleFastTableBuilder::FinishPrevUserKey() {
     entry.valueLen = (uint32_t)valueNum;
     entry.valueMul = 1;
     multi_num_++;
+    if (offset_ == posArr[0]) // all values of this user key are empty
+      DoWriteAppend("\0", 1); // avoid next offset same with curr
   }
   else {
     assert(valueNodeVec_.size() == 1);
     uint64_t pos = valueNodeVec_[0].pos;
     entry.valuePos = uint32_t(pos);
-    entry.valueLen = uint32_t(offset_ - pos);
+    entry.valueLen = uint32_t(prev_value_len_);
     entry.valueMul = 0;
   }
   TERARK_VERIFY(cspp_.insert(prevUserKey_, &entry, &wtoken_));
@@ -256,8 +260,16 @@ void SingleFastTableBuilder::WriteValue(uint64_t seqvt, const Slice& value) {
   valueNodeVec_.push_back({offset_, seqvt});
   if (value.size_)
     DoWriteAppend(value.data_, value.size_);
-  else
+  else if (valueNodeVec_.size() == 1) {
+    // 1. if TopFastIndexEntry::valueMul, just compensate first empty value
+    // 2. if not valueMul, use TopFastIndexEntry::valueLen, it is also ok
     DoWriteAppend("\0", 1);
+  }
+  if (valueNodeVec_.size() == 2 && 0 == prev_value_len_) {
+    valueNodeVec_[0].pos++; // adjust the pos to make posArr satisfy:
+                            // valueLen[i] = posArr[i+1] - posArr[i]
+  }
+  prev_value_len_ = value.size();
 }
 
 const uint64_t kSingleFastTableMagic = 0x747361466c676e53; // SnglFast
@@ -313,20 +325,28 @@ Status SingleFastTableBuilder::Finish() try {
     TERARK_VERIFY(iter->seek_end());
   else
     TERARK_VERIFY(iter->seek_begin());
+  size_t prevPos = 0;
+  size_t nth = 0;
   do {
     auto entry = iter->value_of<TopFastIndexEntry>();
     if (entry.valueMul) {
       size_t valueNum = entry.valueLen;
       auto posArr = (const uint32_t*)cspp_.mem_get(entry.valuePos);
       auto seqArr = (const uint64_t*)(posArr + valueNum + 1);
+      if (nth) TERARK_VERIFY_LT(prevPos, posArr[0]);
       for (size_t i = 0; i < valueNum; i++) {
         size_t currPos = posArr[i];
         size_t nextPos = posArr[i+1];
-        collect(seqArr[i], currPos, nextPos);
+        TERARK_VERIFY_LE(currPos, nextPos);
+        uint64_t seqvt = 0 == i ? entry.seqvt : seqArr[i-1];
+        collect(seqvt, currPos, nextPos - currPos);
       }
+      prevPos = posArr[0];
     } else {
       collect(entry.seqvt, entry.valuePos, entry.valueLen);
+      prevPos = entry.valuePos;
     }
+    nth++;
   } while (isReverse ? iter->decr() : iter->incr());
   iter->dispose();
 //-------------------------------------------------------------------------

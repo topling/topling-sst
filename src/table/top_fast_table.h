@@ -23,6 +23,7 @@ struct TopFastTableOptions {
   WarmupLevel warmupLevel = WarmupLevel::kValue;
   WriteMethod writeMethod = WriteMethod::kToplingFileWrite;
   bool useFilePreallocation = true;
+  int debugLevel = 0;
 };
 
 class TopFastTableFactory : public TableFactory {

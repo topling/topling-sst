@@ -76,6 +76,7 @@ struct TopFastTableOptions_Json : TopFastTableOptions {
     ROCKSDB_JSON_OPT_ENUM(js, warmupLevel);
     ROCKSDB_JSON_OPT_ENUM(js, writeMethod);
     ROCKSDB_JSON_OPT_PROP(js, useFilePreallocation);
+    ROCKSDB_JSON_OPT_PROP(js, debugLevel);
   }
   json ToJson(const json& dump_options, const SidePluginRepo&) const {
     json djs;
@@ -86,6 +87,7 @@ struct TopFastTableOptions_Json : TopFastTableOptions {
     ROCKSDB_JSON_SET_ENUM(djs, warmupLevel);
     ROCKSDB_JSON_SET_ENUM(djs, writeMethod);
     ROCKSDB_JSON_SET_PROP(djs, useFilePreallocation);
+    ROCKSDB_JSON_SET_PROP(djs, debugLevel);
     return djs;
   }
 };

@@ -174,9 +174,6 @@ void SingleFastTableBuilder::Add(const Slice& key, const Slice& value) try {
     // use full ename such as: "kTypeLogData = 0x3"
     TERARK_DIE("unexpected ValueType = %s(%d)", ename, vt);
   }
-  uint64_t estimate_offset = EstimatedFileSize();
-  NotifyCollectTableCollectorsOnAdd(key, value, estimate_offset,
-                                    collectors_, ioptions_.info_log.get());
 }
 catch (const IOStatus& s) {
   TERARK_VERIFY(!s.ok());
@@ -296,6 +293,40 @@ Status SingleFastTableBuilder::Finish() try {
   }
 
   ToplingFlushBuffer();
+
+//------ NotifyCollectTableCollectorsOnAdd(...)
+// Same as SingleFastTableReader::ApproximateOffsetOf()
+  auto iter = cspp_.new_iter();
+  iter->seek_begin();
+  double approximateFileSize = offset_ + 500;
+  double coefficient = approximateFileSize / (indexOffset + 1.0);
+  auto log = ioptions_.info_log.get();
+  auto collect = [&](uint64_t seqvt, size_t valuePos, size_t valueLen) {
+    auto& ukey = iter->mutable_word();
+    unaligned_save(ukey.ensure_unused(8), seqvt);
+    Slice ikey((const char*)ukey.data(), ukey.size() + 8);
+    Slice value(nullptr, valueLen); // just value.size is used by collector
+    uint64_t fakeOffset = valuePos * coefficient;
+    NotifyCollectTableCollectorsOnAdd(ikey, value, fakeOffset, collectors_, log);
+  };
+  do {
+    auto entry = iter->value_of<TopFastIndexEntry>();
+    if (entry.valueMul) {
+      size_t valueNum = entry.valueLen;
+      auto posArr = (const uint32_t*)cspp_.mem_get(entry.valuePos);
+      auto seqArr = (const uint64_t*)(posArr + valueNum + 1);
+      for (size_t i = 0; i < valueNum; i++) {
+        size_t currPos = posArr[i];
+        size_t nextPos = posArr[i+1];
+        collect(seqArr[i], currPos, nextPos);
+      }
+    } else {
+      collect(entry.seqvt, entry.valuePos, entry.valueLen);
+    }
+  } while (iter->incr());
+  iter->dispose();
+//-------------------------------------------------------------------------
+
   WriteMeta(kSingleFastTableMagic, {{kCSPPIndex, {indexOffset, index_size}}});
 
   auto fac = table_factory_;

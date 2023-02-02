@@ -671,7 +671,7 @@ std::string TopFastTableReader::FirstInternalKey(
 std::string TopFastTableReader::ToWebViewString(const json& dump_options) const {
   json djs;
   auto& props = *table_properties_;
-  djs["Props.User"] = TableUserPropsToString(props.user_collected_properties, dump_options);
+  djs["Props.User"] = TableUserPropsToJson(props.user_collected_properties, dump_options);
   djs["PrefixLen"] = offset_info_.prefixSet_.m_fixlen;
   djs["num_entries"] = props.num_entries;
   djs["num_deletions"] = props.num_deletions;

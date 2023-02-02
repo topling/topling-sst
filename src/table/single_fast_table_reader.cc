@@ -517,7 +517,7 @@ std::string SingleFastTableReader::FirstInternalKey(
 std::string SingleFastTableReader::ToWebViewString(const json& dump_options) const {
   json djs;
   auto& props = *table_properties_;
-  djs["Props.User"] = TableUserPropsToString(props.user_collected_properties, dump_options);
+  djs["Props.User"] = TableUserPropsToJson(props.user_collected_properties, dump_options);
   djs["num_entries"] = props.num_entries;
   djs["num_deletions"] = props.num_deletions;
   djs["num_merges"] = props.num_merge_operands;

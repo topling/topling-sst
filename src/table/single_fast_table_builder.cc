@@ -64,6 +64,7 @@ public:
   MemMapStream fmap_;
   mutable size_t cspp_memsize_ = 0;
   uint32_t multi_num_ = 0;
+  bool is_all_seqno_zero_ = true;
   bool is_wtoken_released_ = false;
   WriteMethod writeMethod_;
   long long t0 = 0;
@@ -269,6 +270,9 @@ void SingleFastTableBuilder::WriteValue(uint64_t seqvt, const Slice& value) {
     valueNodeVec_[0].pos++; // adjust the pos to make posArr satisfy:
                             // valueLen[i] = posArr[i+1] - posArr[i]
   }
+  if (seqvt >> 8) {
+    is_all_seqno_zero_ = false;
+  }
   prev_value_len_ = value.size();
 }
 
@@ -302,6 +306,9 @@ Status SingleFastTableBuilder::Finish() try {
   }
   if (max_val_len == min_val_len) {
     properties_.fixed_value_len = max_val_len;
+  }
+  if (is_all_seqno_zero_) {
+    properties_.compression_options = "allseq0";
   }
 
   ToplingFlushBuffer();

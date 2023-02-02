@@ -171,6 +171,9 @@ Status SingleFastTableReader::Get(const ReadOptions& readOptions,
   }
   else {
     UnPackSequenceAndType(entry.seqvt, &pikey.sequence, &pikey.type);
+    if (pikey.sequence == 0) {
+      pikey.sequence = global_seqno_;
+    }
     if (pikey.sequence <= finding_seq) {
       if (!just_check_key_exists) {
         val.data_ = file_data_.data_ + entry.valuePos;
@@ -199,6 +202,7 @@ public:
   const SingleFastTableReader* tab_;
   MainPatricia* cspp_;
   Patricia::Iterator* iter_;
+  uint64_t global_seqno_;
   int val_idx_;
   int val_num_;
   uint32_t val_pos_;
@@ -210,6 +214,7 @@ public:
     tab_ = table;
     cspp_ = table->cspp_;
     iter_ = table->cspp_->new_iter();
+    global_seqno_ = table->global_seqno_;
     SetInvalid();
   }
   ~BaseIter() override {
@@ -237,7 +242,6 @@ public:
   }
   void SetAtFirstValue() {
     auto entry = iter_->value_of<TopFastIndexEntry>();
-    unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
     if (entry.valueMul) {
       val_num_ = entry.valueLen;
       assert(val_num_ >= 2);
@@ -251,8 +255,11 @@ public:
       seq_arr_ = nullptr;
       val_pos_ = entry.valuePos;
       val_len_ = entry.valueLen;
+      if (entry.seqvt >> 8 == 0)
+        entry.seqvt = PackSequenceAndType(global_seqno_, ValueType(entry.seqvt));
     }
     val_idx_ = 0;
+    unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
   }
   void SetAtLastValue() {
     auto entry = iter_->value_of<TopFastIndexEntry>();
@@ -272,6 +279,8 @@ public:
       val_idx_ = 0;
       val_pos_ = entry.valuePos;
       val_len_ = entry.valueLen;
+      if (entry.seqvt >> 8 == 0)
+        entry.seqvt = PackSequenceAndType(global_seqno_, ValueType(entry.seqvt));
     }
     unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
   }
@@ -309,6 +318,8 @@ public:
       seq_arr_ = nullptr;
       val_pos_ = entry.valuePos;
       val_len_ = entry.valueLen;
+      if (entry.seqvt >> 8 == 0)
+        entry.seqvt = PackSequenceAndType(global_seqno_, ValueType(entry.seqvt));
       if ((entry.seqvt >> 8) <= seq)
         unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
       else
@@ -396,6 +407,8 @@ public:
       uint64_t seqvt = val_idx_ > 0
                      ? unaligned_load<uint64_t>(seq_arr_, val_idx_-1)
                      : iter_->value_of<TopFastIndexEntry>().seqvt;
+      if (seqvt >> 8 == 0)
+        seqvt = PackSequenceAndType(global_seqno_, ValueType(seqvt));
       unaligned_save(iter_->mutable_word().end(), seqvt);
       val_pos_ = pos_arr_[val_idx_];
       val_len_ = pos_arr_[val_idx_ + 1] - val_pos_;
@@ -462,6 +475,8 @@ public:
       uint64_t seqvt = val_idx_ > 0
                      ? unaligned_load<uint64_t>(seq_arr_, val_idx_-1)
                      : iter_->value_of<TopFastIndexEntry>().seqvt;
+      if (seqvt >> 8 == 0)
+        seqvt = PackSequenceAndType(global_seqno_, ValueType(seqvt));
       unaligned_save(iter_->mutable_word().end(), seqvt);
       val_pos_ = pos_arr_[val_idx_];
       val_len_ = pos_arr_[val_idx_ + 1] - val_pos_;
@@ -570,6 +585,10 @@ void SingleFastTableReader::Open(RandomAccessFileReader* file, Slice file_data,
     file_.release(); // NOLINT
     t->Open(file, file_data, tro);
     throw t.release(); // NOLINT
+  }
+  if (!fstring(table_properties_->compression_options).strstr("allseq0")) {
+    // special case: if entry.valueMul, global_seqno_ must be 0
+    global_seqno_ = 0;
   }
   BlockContents indexBlock = ReadMetaBlockE(file, file_size,
         kSingleFastTableMagic, tro.ioptions, kCSPPIndex);

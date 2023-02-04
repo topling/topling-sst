@@ -242,6 +242,16 @@ ApproximateKeyAnchors(const ReadOptions&, std::vector<Anchor>& anchors) {
 }
 #endif
 
+InternalIterator* TopTableReaderBase::EasyNewIter() {
+  // upstream rocksdb may add/remove params, one param per line makes us
+  // easily adapt upstream changes and keep our change history min diff
+  return this->NewIterator(ReadOptions(),
+                           nullptr, // prefix_extractor
+                           nullptr, // arena
+                           false,   // skip_filters
+                           TableReaderCaller::kUserIterator);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 void
 TopEmptyTableReader::Open(RandomAccessFileReader* file, Slice file_data, const TableReaderOptions& tro) {

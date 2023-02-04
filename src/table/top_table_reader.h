@@ -66,6 +66,8 @@ public:
 
   ~TopTableReaderBase() override;
 
+  InternalIterator* EasyNewIter();
+
   void LoadCommonPart(RandomAccessFileReader*, const TableReaderOptions&, Slice file_data, uint64_t magic);
   virtual std::string ToWebViewString(const json& dump_options) const = 0;
 

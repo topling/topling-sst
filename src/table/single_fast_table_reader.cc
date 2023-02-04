@@ -38,7 +38,6 @@ public:
               size_t compaction_readahead_size,
               bool allow_unprepared_value) final;
 
-  uint64_t ApproximateOffsetOf_impl(const Slice& key, Patricia::Iterator*);
   uint64_t ApproximateOffsetOf(const Slice& key, TableReaderCaller) final;
   uint64_t ApproximateSize(const Slice&, const Slice&, TableReaderCaller) final;
   void SetupForCompaction() final;
@@ -66,8 +65,12 @@ public:
   class RevIter;
 };
 
-uint64_t SingleFastTableReader::ApproximateOffsetOf_impl(const Slice& ikey, Patricia::Iterator* iter) {
-  // we ignore seqnum of ikey
+uint64_t SingleFastTableReader::ApproximateOffsetOf(const Slice& ikey, TableReaderCaller) {
+  auto iter = (Patricia::Iterator*)iter_cache_.Get();
+  if (UNLIKELY(!iter)) {
+    iter = cspp_->new_iter();
+    iter_cache_.Reset(iter);
+  }
   fstring user_key(ikey.data(), ikey.size() - 8);
   if (iter->seek_lower_bound(user_key)) {
     auto entry = iter->value_of<TopFastIndexEntry>();
@@ -80,14 +83,6 @@ uint64_t SingleFastTableReader::ApproximateOffsetOf_impl(const Slice& ikey, Patr
   }
   return file_data_.size_;
 }
-uint64_t SingleFastTableReader::ApproximateOffsetOf(const Slice& ikey, TableReaderCaller) {
-  auto iter = (Patricia::Iterator*)iter_cache_.Get();
-  if (UNLIKELY(!iter)) {
-    iter = cspp_->new_iter();
-    iter_cache_.Reset(iter);
-  }
-  return ApproximateOffsetOf_impl(ikey, iter);
-}
 uint64_t SingleFastTableReader::ApproximateSize(const Slice& beg, const Slice& end,
                                                 TableReaderCaller) {
   auto iter = (Patricia::Iterator*)iter_cache_.Get();
@@ -95,9 +90,25 @@ uint64_t SingleFastTableReader::ApproximateSize(const Slice& beg, const Slice& e
     iter = cspp_->new_iter();
     iter_cache_.Reset(iter);
   }
-  uint64_t offset_beg = ApproximateOffsetOf_impl(beg, iter);
-  uint64_t offset_end = ApproximateOffsetOf_impl(end, iter);
-  return offset_end - offset_beg;
+  fstring ukeyBeg(beg.data_, beg.size_ - 8);
+  fstring ukeyEnd(end.data_, end.size_ - 8);
+  double sum_val_len = index_offset_ + 1.0;
+  double coefficient = file_data_.size_ / sum_val_len;
+  size_t vposBeg = index_offset_, vposEnd = index_offset_;
+  if (iter->seek_lower_bound(ukeyBeg)) {
+    auto en = iter->value_of<TopFastIndexEntry>();
+    vposBeg = en.valueMul ? aligned_load<uint32_t>(cspp_->mem_get(en.valuePos))
+            : en.valuePos;
+  }
+  if (iter->seek_lower_bound(ukeyEnd)) {
+    auto en = iter->value_of<TopFastIndexEntry>();
+    vposEnd = en.valueMul ? aligned_load<uint32_t>(cspp_->mem_get(en.valuePos))
+            : en.valuePos;
+  }
+  if (vposBeg < vposEnd)
+    return uint64_t(coefficient * (vposEnd - vposBeg));
+  else
+    return uint64_t(coefficient * (vposBeg - vposEnd));
 }
 
 void SingleFastTableReader::SetupForCompaction() {

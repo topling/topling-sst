@@ -103,11 +103,6 @@ void MmapColdizeBytes(const void* addr, size_t len) {
   }
 }
 
-// defined in block_based_table_reader.cc
-Status GetGlobalSequenceNumber(const TableProperties& table_properties,
-                               SequenceNumber largest_seqno,
-                               SequenceNumber* seqno);
-
 Block* DetachBlockContents(BlockContents &tombstoneBlock, SequenceNumber global_seqno)
 {
   auto tombstoneBuf = AllocateBlock(tombstoneBlock.data.size(), nullptr);
@@ -202,9 +197,28 @@ void TopTableReaderBase::LoadCommonPart(RandomAccessFileReader* file,
 // verify comparator end
 
   isReverseBytewiseOrder_ = !IsForwardBytewiseComparator(ioptions.user_comparator);
-  GetGlobalSequenceNumber(*props, tro.largest_seqno, &global_seqno_);
-  if (global_seqno_ >= kMaxSequenceNumber) {
-    global_seqno_ = 0;
+
+  // BlockBasedTable makes global seqno too complex, we do KISS:
+  //  1. If all seqno in the sst are all zeros, tro.largest_seqno will be
+  //     used as global_seqno_
+  //  2. tro.largest_seqno can be zero
+  //  3. in rocksdb, global seqno is used only for ingested SST
+  //     * for ingested SSTs, all seqno are zeros, thus global seqno take
+  //                          ^^^^^^^^^^^^^^^^^^^
+  //       in effect only when all seqno are zeros
+  //                           ^^^^^^^^^^^^^^^^^^^
+  //     * topling SST do replace zero seqno as global seqno only when
+  //       all seqno in the SST are zeros
+  //       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  //     * how to judge `all seqno in the SST are zeros` is the implementation
+  //       details of Topling's concret SSTs
+  //
+  //  4. `global_seqno_ = 0` has the same effect of disable global seqno
+  //                                                ^^^^^^^^^^^^^^^^^^^^
+  if (tro.largest_seqno < kMaxSequenceNumber) {
+    global_seqno_ = tro.largest_seqno;
+  } else {
+    global_seqno_ = 0; // equivalent to `disable global seqno`
   }
   Debug(ioptions.info_log,
        "TopTableReaderBase::LoadCommonPart(%s): global_seqno = %" PRIu64,

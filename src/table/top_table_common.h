@@ -71,7 +71,7 @@ const std::string kRangeDelBlock = "rocksdb.range_del";
 
 template<class ByteArray>
 inline Slice SliceOf(const ByteArray& ba) {
-  static_assert(sizeof(ba[0] == 1));
+  static_assert(sizeof(ba[0]) == 1);
   return Slice((const char*)ba.data(), ba.size());
 }
 

@@ -131,12 +131,12 @@ inline uint64_t ReadBigEndianUint64Aligned(fstring data) {
 
 inline void SaveAsBigEndianUint64(byte_t* beg, size_t len, uint64_t value) {
   assert(len <= 8);
+  ROCKSDB_ASSUME(len <= 8);
   union {
     byte_t bytes[8];
     uint64_t value;
   } c;
   c.value = BIG_ENDIAN_OF(value);
-  if (len > 8) len = 8; // with this line, compiler can optimize better
   memcpy(beg, c.bytes + (8 - len), len);
 }
 

@@ -7,6 +7,7 @@
 #include <terark/util/sortable_strvec.hpp>
 
 #include <inttypes.h>
+#include <rocksdb/preproc.h>
 #include <rocksdb/slice.h>
 #include <logging/logging.h>
 
@@ -119,15 +120,6 @@ uint64_t ReadBigEndianUint64Aligned(const byte_t* beg, size_t len) {
   assert(8 == len); TERARK_UNUSED_VAR(len);
   return NATIVE_OF_BIG_ENDIAN(*(const uint64_t*)beg);
 }
-inline
-uint64_t ReadBigEndianUint64Aligned(const byte_t* beg, const byte_t* end) {
-  assert(end - beg == 8); TERARK_UNUSED_VAR(end);
-  return NATIVE_OF_BIG_ENDIAN(*(const uint64_t*)beg);
-}
-inline uint64_t ReadBigEndianUint64Aligned(fstring data) {
-  assert(data.size() == 8);
-  return NATIVE_OF_BIG_ENDIAN(*(const uint64_t*)data.p);
-}
 
 inline void SaveAsBigEndianUint64(byte_t* beg, size_t len, uint64_t value) {
   assert(len <= 8);
@@ -138,11 +130,6 @@ inline void SaveAsBigEndianUint64(byte_t* beg, size_t len, uint64_t value) {
   } c;
   c.value = BIG_ENDIAN_OF(value);
   memcpy(beg, c.bytes + (8 - len), len);
-}
-
-inline void SaveAsBigEndianUint64(byte_t* beg, byte_t* end, uint64_t value) {
-  assert(end - beg <= 8);
-  SaveAsBigEndianUint64(beg, end-beg, value);
 }
 
 template<class T>

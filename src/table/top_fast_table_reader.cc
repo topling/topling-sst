@@ -170,6 +170,7 @@ Status TopFastTableReader::Get(const ReadOptions& readOptions,
   const SequenceNumber finding_seq = pikey.sequence;
   Slice val;
   Cleanable noop_pinner;
+  Cleanable* pinner = readOptions.pinning_tls ? &noop_pinner : nullptr;
   if (entry.valueMul) {
     size_t valueNum = entry.valueLen;
     TERARK_ASSERT_GE(valueNum, 2);
@@ -186,7 +187,7 @@ Status TopFastTableReader::Get(const ReadOptions& readOptions,
           pikey.type = kTypeValue; // instruct SaveValue to stop earlier
         }
       }
-      if (!get_context->SaveValue(pikey, val, &matched, &noop_pinner)) {
+      if (!get_context->SaveValue(pikey, val, &matched, pinner)) {
         return st;
       }
     }
@@ -206,7 +207,7 @@ Status TopFastTableReader::Get(const ReadOptions& readOptions,
       auto seqvt = unaligned_load<uint64_t>(seqArr, lo);
       UnPackSequenceAndType(seqvt, &pikey.sequence, &pikey.type);
       TERARK_ASSERT_LE(pikey.sequence, finding_seq);
-      if (!get_context->SaveValue(pikey, val, &matched, &noop_pinner)) {
+      if (!get_context->SaveValue(pikey, val, &matched, pinner)) {
         return st;
       }
     }
@@ -223,7 +224,7 @@ Status TopFastTableReader::Get(const ReadOptions& readOptions,
           pikey.type = kTypeValue; // instruct SaveValue to stop earlier
         }
       }
-      get_context->SaveValue(pikey, val, &matched, &noop_pinner);
+      get_context->SaveValue(pikey, val, &matched, pinner);
     }
   }
   return st;

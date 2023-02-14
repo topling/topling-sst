@@ -503,8 +503,7 @@ Status CSPPAutoSortTableReader::Get(const ReadOptions& read_options,
           pikey.type = kTypeValue; // instruct SaveValue to stop earlier
       }
       Cleanable noop_pinner;
-      bool matched;
-      get_context->SaveValue(pikey, val, &matched, &noop_pinner);
+      get_context->SaveValue(pikey, val, &noop_pinner);
     }
   }
   return Status::OK();

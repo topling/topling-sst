@@ -166,7 +166,6 @@ Status TopFastTableReader::Get(const ReadOptions& readOptions,
   }
   bool const just_check_key_exists = readOptions.just_check_key_exists;
   auto entry = token.value_of<TopFastIndexEntry>();
-  bool matched;
   const SequenceNumber finding_seq = pikey.sequence;
   Slice val;
   Cleanable noop_pinner;
@@ -187,7 +186,7 @@ Status TopFastTableReader::Get(const ReadOptions& readOptions,
           pikey.type = kTypeValue; // instruct SaveValue to stop earlier
         }
       }
-      if (!get_context->SaveValue(pikey, val, &matched, pinner)) {
+      if (!get_context->SaveValue(pikey, val, pinner)) {
         return st;
       }
     }
@@ -207,7 +206,7 @@ Status TopFastTableReader::Get(const ReadOptions& readOptions,
       auto seqvt = unaligned_load<uint64_t>(seqArr, lo);
       UnPackSequenceAndType(seqvt, &pikey.sequence, &pikey.type);
       TERARK_ASSERT_LE(pikey.sequence, finding_seq);
-      if (!get_context->SaveValue(pikey, val, &matched, pinner)) {
+      if (!get_context->SaveValue(pikey, val, pinner)) {
         return st;
       }
     }
@@ -224,7 +223,7 @@ Status TopFastTableReader::Get(const ReadOptions& readOptions,
           pikey.type = kTypeValue; // instruct SaveValue to stop earlier
         }
       }
-      get_context->SaveValue(pikey, val, &matched, pinner);
+      get_context->SaveValue(pikey, val, pinner);
     }
   }
   return st;

@@ -129,7 +129,6 @@ public:
   const VecAutoSortTableFactory* table_factory_;
   valvec<byte_t> strvec_;
   AutoGrownMemIO lenbuf_;
-  int debugLevel_;
   ushort minUserKeyLen_;
   uint32_t min_key_len_ = UINT32_MAX, max_key_len_ = 0;
   uint32_t min_val_len_ = UINT32_MAX, max_val_len_ = 0;

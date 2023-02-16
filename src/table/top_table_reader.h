@@ -49,6 +49,7 @@ protected:
   Slice file_data_;
   bool isReverseBytewiseOrder_ = false;
   bool advise_random_on_open_ = false;
+  int debugLevel_ = 0;
   SequenceNumber GetSequenceNumber() const { return global_seqno_; }
   void LoadTombstone(RandomAccessFileReader*, const TableReaderOptions&, uint64_t file_size, uint64_t magic);
 

@@ -780,15 +780,10 @@ CSPPAutoSortTableFactory::NewTableReader(
             bool prefetch_index_and_filter_in_cache)
 const try {
   (void)prefetch_index_and_filter_in_cache; // now ignore
-  IOOptions ioopt;
   Slice file_data;
   bool populate = true;
   file->exchange(new MmapReadWrapper(file, populate));
- #if ROCKSDB_MAJOR < 7
-  Status s = file->Read(ioopt, 0, file_size, &file_data, nullptr, nullptr);
- #else
-  Status s = file->Read(ioopt, 0, file_size, &file_data, nullptr, nullptr, Env::IO_HIGH);
- #endif
+  Status s = TopMmapReadAll(*file, file_size, &file_data);
   if (!s.ok()) {
     return s;
   }

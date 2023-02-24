@@ -36,6 +36,16 @@ public:
                 Slice* result, char* scratch, IODebugContext*) const final;
 };
 
+inline Status TopMmapReadAll
+(RandomAccessFileReader& file, uint64_t file_size, Slice* file_data) {
+  IOOptions ioopt;
+#if ROCKSDB_MAJOR < 7
+  return file.Read(ioopt, 0, file_size, file_data, nullptr, nullptr);
+#else
+  return file.Read(ioopt, 0, file_size, file_data, nullptr, nullptr, Env::IO_TOTAL);
+#endif
+}
+
 class TopTableReaderBase : public TableReader, boost::noncopyable {
 protected:
   std::unique_ptr<RandomAccessFileReader> file_;

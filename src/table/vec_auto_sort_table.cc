@@ -1190,7 +1190,8 @@ bool VecAutoSortTableReader::GetRandomInteranlKeysAppend(
     }
     uint64_t seqvt = PackSequenceAndType(global_seqno_, kTypeValue);
     std::string ikey;
-    ikey.reserve(ukey.size() + 8);
+    ikey.reserve(pref_len_ + ukey.size() + 8);
+    ikey.append((char*)sstmeta_->common_prefix, pref_len_);
     ikey.append(ukey.data(), ukey.size());
     ikey.append((char*)&seqvt, sizeof(seqvt));
     output->push_back(ikey);

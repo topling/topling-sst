@@ -47,7 +47,7 @@ public:
                      bool skip_filters) final;
 
   Status VerifyChecksum(const ReadOptions&, TableReaderCaller) final;
-  bool GetRandomInteranlKeysAppend(size_t num, std::vector<std::string>* output) const final;
+  bool GetRandomInternalKeysAppend(size_t num, std::vector<std::string>* output) const final;
   std::string FirstInternalKey(Slice user_key, MainPatricia::SingleReaderToken&) const;
 
   std::string ToWebViewString(const json& dump_options) const final;
@@ -633,7 +633,7 @@ TopFastTableReader::NewIterator(const ReadOptions& ro,
     return a ? new(a->AllocateAligned(sizeof(Iter)))Iter(this) : new Iter(this);
 }
 
-bool TopFastTableReader::GetRandomInteranlKeysAppend(
+bool TopFastTableReader::GetRandomInternalKeysAppend(
                   size_t num, std::vector<std::string>* output) const {
   size_t oldsize = output->size();
   size_t avgnum = ceiled_div(num, cspp_.size());

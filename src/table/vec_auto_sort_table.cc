@@ -728,7 +728,7 @@ public:
   Status GetImpl(const ReadOptions&, const Slice& ikey, GetContext*, const StrVec&);
 
   Status VerifyChecksum(const ReadOptions&, TableReaderCaller) final;
-  bool GetRandomInteranlKeysAppend(size_t num, std::vector<std::string>* output) const final;
+  bool GetRandomInternalKeysAppend(size_t num, std::vector<std::string>* output) const final;
   std::string ToWebViewString(const json& dump_options) const final;
 
 // data member also public
@@ -1168,7 +1168,7 @@ VecAutoSortTableReader::NewIterator(const ReadOptions& ro,
     return a ? new(a->AllocateAligned(IterMemSize))Iter(this, 1) : new Iter(this, 0);
 }
 
-bool VecAutoSortTableReader::GetRandomInteranlKeysAppend(
+bool VecAutoSortTableReader::GetRandomInternalKeysAppend(
                   size_t num, std::vector<std::string>* output) const {
   SortableStrVec keys;
   auto seed = num + size_t(output) + size_t(this);

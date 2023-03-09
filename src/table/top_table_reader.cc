@@ -235,7 +235,7 @@ Status TopTableReaderBase::
 ApproximateKeyAnchors(const ReadOptions&, std::vector<Anchor>& anchors) {
   std::vector<std::string> rand_keys;
   Status s;
-  if (GetRandomInteranlKeysAppend(128, &rand_keys)) {
+  if (GetRandomInternalKeysAppend(128, &rand_keys)) {
     for (auto& key : rand_keys) { // convert internal key to user key
       key.resize(key.size() - 8); // remove SeqNum+Type
     }
@@ -250,7 +250,7 @@ ApproximateKeyAnchors(const ReadOptions&, std::vector<Anchor>& anchors) {
     }
   }
   else {
-    s = Status::NotSupported("GetRandomInteranlKeysAppend() not supported.");
+    s = Status::NotSupported("GetRandomInternalKeysAppend() not supported.");
   }
   return s;
 }

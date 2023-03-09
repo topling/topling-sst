@@ -417,7 +417,7 @@ public:
                      bool skip_filters) final;
 
   Status VerifyChecksum(const ReadOptions&, TableReaderCaller) final;
-  bool GetRandomInteranlKeysAppend(size_t num, std::vector<std::string>* output) const final;
+  bool GetRandomInternalKeysAppend(size_t num, std::vector<std::string>* output) const final;
   std::string FirstInternalKey(Slice user_key, MainPatricia::SingleReaderToken&) const;
   std::string ToWebViewString(const json& dump_options) const final;
 
@@ -693,7 +693,7 @@ CSPPAutoSortTableReader::NewIterator(const ReadOptions& ro,
     return a ? new(a->AllocateAligned(sizeof(Iter)))Iter(this) : new Iter(this);
 }
 
-bool CSPPAutoSortTableReader::GetRandomInteranlKeysAppend(
+bool CSPPAutoSortTableReader::GetRandomInternalKeysAppend(
                   size_t num, std::vector<std::string>* output) const {
   SortableStrVec keys;
   cspp_->dfa_get_random_keys(&keys, num);

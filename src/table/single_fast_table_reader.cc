@@ -252,7 +252,7 @@ public:
       SeekForPrevAux(target, InternalKeyComparator(BytewiseComparator()));
   }
   void SetAtFirstValue() {
-    auto entry = iter_->value_of<TopFastIndexEntry>();
+    auto entry = cspp_->value_of<TopFastIndexEntry>(*iter_);
     if (entry.valueMul) {
       val_num_ = entry.valueLen;
       assert(val_num_ >= 2);
@@ -273,7 +273,7 @@ public:
     unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
   }
   void SetAtLastValue() {
-    auto entry = iter_->value_of<TopFastIndexEntry>();
+    auto entry = cspp_->value_of<TopFastIndexEntry>(*iter_);
     if (entry.valueMul) {
       val_num_ = entry.valueLen;
       assert(val_num_ >= 2);
@@ -296,7 +296,7 @@ public:
     unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
   }
   void SeekSeq(uint64_t seq) {
-    auto entry = iter_->value_of<TopFastIndexEntry>();
+    auto entry = cspp_->value_of<TopFastIndexEntry>(*iter_);
     if (entry.valueMul) {
       size_t vnum = entry.valueLen;
       val_num_ = entry.valueLen;
@@ -417,7 +417,7 @@ public:
     if (--val_idx_ >= 0) {
       uint64_t seqvt = val_idx_ > 0
                      ? unaligned_load<uint64_t>(seq_arr_, val_idx_-1)
-                     : iter_->value_of<TopFastIndexEntry>().seqvt;
+                     : cspp_->value_of<TopFastIndexEntry>(*iter_).seqvt;
       if (seqvt >> 8 == 0)
         seqvt = PackSequenceAndType(global_seqno_, ValueType(seqvt));
       unaligned_save(iter_->mutable_word().end(), seqvt);
@@ -485,7 +485,7 @@ public:
     if (--val_idx_ >= 0) {
       uint64_t seqvt = val_idx_ > 0
                      ? unaligned_load<uint64_t>(seq_arr_, val_idx_-1)
-                     : iter_->value_of<TopFastIndexEntry>().seqvt;
+                     : cspp_->value_of<TopFastIndexEntry>(*iter_).seqvt;
       if (seqvt >> 8 == 0)
         seqvt = PackSequenceAndType(global_seqno_, ValueType(seqvt));
       unaligned_save(iter_->mutable_word().end(), seqvt);

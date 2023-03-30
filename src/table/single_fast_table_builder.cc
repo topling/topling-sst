@@ -230,7 +230,7 @@ void SingleFastTableBuilder::FinishPrevUserKey() {
     entry.valueMul = 0;
   }
   TERARK_VERIFY(cspp_.insert(prevUserKey_, &entry, &wtoken_));
-  TERARK_VERIFY(wtoken_.value() != nullptr);
+  TERARK_VERIFY(wtoken_.has_value());
   valueNodeVec_.erase_all();
 }
 
@@ -266,7 +266,7 @@ void SingleFastTableBuilder::WriteValue(uint64_t seqvt, const Slice& value) {
     // 2. if not valueMul, use TopFastIndexEntry::valueLen, it is also ok
     DoWriteAppend("\0", 1);
   }
-  if (valueNodeVec_.size() == 2 && 0 == prev_value_len_) {
+  else if (valueNodeVec_.size() == 2 && 0 == prev_value_len_) {
     valueNodeVec_[0].pos++; // adjust the pos to make posArr satisfy:
                             // valueLen[i] = posArr[i+1] - posArr[i]
   }

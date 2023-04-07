@@ -57,6 +57,7 @@ protected:
 #endif
   SequenceNumber global_seqno_ = kDisableGlobalSequenceNumber;
   Slice file_data_;
+  bool enableApproximateKeyAnchors_ = true;
   bool isReverseBytewiseOrder_ = false;
   bool advise_random_on_open_ = false;
   int debugLevel_ = 0;

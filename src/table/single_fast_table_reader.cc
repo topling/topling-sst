@@ -603,9 +603,9 @@ void SingleFastTableReader::Open(RandomAccessFileReader* file, Slice file_data,
   }
   auto props = table_properties_.get();
   if (0 == props->tag_size) {
-    auto rows = props->num_entries - props->num_range_deletions;
-    props->index_size -= rows * 8;
-    props->tag_size = rows * 8;
+    auto entries = props->num_entries;
+    props->index_size -= entries * 8;
+    props->tag_size = entries * 8;
   }
   BlockContents indexBlock = ReadMetaBlockE(file, file_size,
         kSingleFastTableMagic, tro.ioptions, kCSPPIndex);

@@ -231,6 +231,20 @@ inline void MmapAdvSeq(const Vec& v) {
   MmapAdvSeq(v.data(), sizeof(v.data()[0]) * v.size());
 }
 
+terark_forceinline
+void TryWarmupZeroCopy(const valvec<byte_t>& buf, size_t min_prefault_pages) {
+#ifdef TOPLINGDB_WARMUP_ZERO_COPY
+  if (buf.capacity() == 0 && buf.size() != 0) {
+    size_t lo = terark::pow2_align_down(size_t(buf.data()), 4096);
+    size_t hi = terark::pow2_align_up(size_t(buf.end()), 4096);
+    size_t len = hi - lo;
+    if (UNLIKELY(len >= min_prefault_pages * 4096)) {
+      MmapWarmUpBytes((void*)lo, len);
+    }
+  }
+#endif
+}
+
 // compatible to DFA_MmapHeaderBase, so UintIndex/CompositeIndex header
 // are compabitle to NLT index header
 struct ToplingIndexHeader {

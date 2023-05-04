@@ -213,5 +213,6 @@ struct TopFastTableFactory_Manip : PluginManipFunc<TableFactory> {
   }
 };
 ROCKSDB_REG_PluginManip("ToplingFastTable", TopFastTableFactory_Manip);
+ROCKSDB_REG_PluginManip("SingleFastTable", TopFastTableFactory_Manip);
 
 } // namespace ROCKSDB_NAMESPACE

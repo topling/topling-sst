@@ -114,6 +114,7 @@ uint64_t TopFastTableReader::ApproximateSize(const Slice& beg, const Slice& end,
 }
 
 void TopFastTableReader::SetupForCompaction() {
+  MmapAdvSeq(file_data_);
 }
 
 void TopFastTableReader::Prepare(const Slice& /*target*/) {

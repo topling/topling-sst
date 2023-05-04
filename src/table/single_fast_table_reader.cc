@@ -112,6 +112,7 @@ uint64_t SingleFastTableReader::ApproximateSize(const Slice& beg, const Slice& e
 }
 
 void SingleFastTableReader::SetupForCompaction() {
+  MmapAdvSeq(file_data_);
 }
 
 void SingleFastTableReader::Prepare(const Slice& /*target*/) {

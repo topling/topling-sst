@@ -157,7 +157,8 @@ Status ReadTableProperties(RandomAccessFileReader* file, uint64_t file_size,
   MemoryAllocator* memory_allocator = nullptr;
   FilePrefetchBuffer* prefetch_buffer = nullptr;
   Status s = ReadTableProperties(file, file_size, table_magic_number,
-                  ioptions, &prop, memory_allocator, prefetch_buffer);
+                  ioptions, ROCKSDB_8_X_COMMA(ReadOptions())
+                  &prop, memory_allocator, prefetch_buffer);
   *properties = prop.release();
   return s;
 }
@@ -381,6 +382,9 @@ BlockContents ReadMetaBlockE(RandomAccessFileReader* file,
   BlockContents contents;
   Status s = ReadMetaBlock(file, prefetch_buffer,
         file_size, table_magic_number, ioptions,
+    #if ROCKSDB_MAJOR >= 8
+        ReadOptions(),
+    #endif
         meta_block_name, BlockType::kMetaIndex, &contents,
         compression_type_missing);
   if (!s.ok()) {
@@ -399,7 +403,7 @@ OpenSST(const std::string& fname, uint64_t file_size,
   std::unique_ptr<FSRandomAccessFile> raf;
   FileOptions fopt; //fopt.use_mmap_reads = true;
   TableReaderOptions tro(ioptions, nullptr, fopt,
-                         ioptions.internal_comparator);
+                         ioptions.internal_comparator ROCKSDB_8_COMMA_X(0));
   bool prefetch_index_and_filter_in_cache = false;
   IODebugContext iodbg;
   IOStatus s = ioptions.fs->NewRandomAccessFile(fname, fopt, &raf, &iodbg);

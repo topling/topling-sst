@@ -36,8 +36,8 @@ public:
               size_t compaction_readahead_size,
               bool allow_unprepared_value) final;
 
-  uint64_t ApproximateOffsetOf(const Slice& key, TableReaderCaller) final;
-  uint64_t ApproximateSize(const Slice&, const Slice&, TableReaderCaller) final;
+  uint64_t ApproximateOffsetOf(ROCKSDB_8_X_COMMA(const ReadOptions& readopt) const Slice& key, TableReaderCaller) final;
+  uint64_t ApproximateSize(ROCKSDB_8_X_COMMA(const ReadOptions& readopt) const Slice&, const Slice&, TableReaderCaller) final;
   void SetupForCompaction() final;
   void Prepare(const Slice& /*target*/) final;
   size_t ApproximateMemoryUsage() const final;
@@ -63,7 +63,9 @@ public:
   class RevIter;
 };
 
-uint64_t TopFastTableReader::ApproximateOffsetOf(const Slice& ikey, TableReaderCaller) {
+uint64_t TopFastTableReader::ApproximateOffsetOf(
+      ROCKSDB_8_X_COMMA(const ReadOptions& readopt)
+      const Slice& ikey, TableReaderCaller) {
   // we ignore seqnum of ikey
   fstring user_key(ikey.data(), ikey.size() - 8);
   size_t lower;
@@ -106,10 +108,10 @@ uint64_t TopFastTableReader::ApproximateOffsetOf(const Slice& ikey, TableReaderC
   return val_pos;
 }
 
-uint64_t TopFastTableReader::ApproximateSize(const Slice& beg, const Slice& end,
-                                                TableReaderCaller caller) {
-  uint64_t offset_beg = ApproximateOffsetOf(beg, caller);
-  uint64_t offset_end = ApproximateOffsetOf(end, caller);
+uint64_t TopFastTableReader::ApproximateSize(ROCKSDB_8_X_COMMA(const ReadOptions& readopt)
+      const Slice& beg, const Slice& end, TableReaderCaller caller) {
+  uint64_t offset_beg = ApproximateOffsetOf(ROCKSDB_8_X_COMMA(readopt)beg, caller);
+  uint64_t offset_end = ApproximateOffsetOf(ROCKSDB_8_X_COMMA(readopt)end, caller);
   return offset_end - offset_beg;
 }
 

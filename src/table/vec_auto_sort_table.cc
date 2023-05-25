@@ -717,8 +717,8 @@ public:
               size_t compaction_readahead_size,
               bool allow_unprepared_value) final;
 
-  uint64_t ApproximateOffsetOf(const Slice& key, TableReaderCaller) final;
-  uint64_t ApproximateSize(const Slice&, const Slice&, TableReaderCaller) final;
+  uint64_t ApproximateOffsetOf(ROCKSDB_8_X_COMMA(const ReadOptions& readopt) const Slice& key, TableReaderCaller) final;
+  uint64_t ApproximateSize(ROCKSDB_8_X_COMMA(const ReadOptions& readopt) const Slice&, const Slice&, TableReaderCaller) final;
   size_t ApproximateMemoryUsage() const final { return file_data_.size_; }
   Status Get(const ReadOptions& readOptions, const Slice& key,
                      GetContext* get_context,
@@ -802,7 +802,9 @@ public:
   class RevIter;
 };
 
-uint64_t VecAutoSortTableReader::ApproximateOffsetOf(const Slice& ikey, TableReaderCaller) {
+uint64_t
+VecAutoSortTableReader::ApproximateOffsetOf(ROCKSDB_8_X_COMMA(const ReadOptions& readopt)
+                        const Slice& ikey, TableReaderCaller) {
   TERARK_VERIFY_GE(ikey.size(), 8);
   fstring user_key(ikey.data(), ikey.size() - 8);
   int cmp = memcmp(sstmeta_->common_prefix, user_key.data(),
@@ -839,10 +841,11 @@ uint64_t VecAutoSortTableReader::ApproximateOffsetOf(const Slice& ikey, TableRea
   }
   return file_data_.size_;
 }
-uint64_t VecAutoSortTableReader::ApproximateSize(const Slice& beg, const Slice& end,
+uint64_t VecAutoSortTableReader::ApproximateSize(ROCKSDB_8_X_COMMA(const ReadOptions& readopt)
+                                              const Slice& beg, const Slice& end,
                                               TableReaderCaller caller) {
-  uint64_t offset_beg = ApproximateOffsetOf(beg, caller);
-  uint64_t offset_end = ApproximateOffsetOf(end, caller);
+  uint64_t offset_beg = ApproximateOffsetOf(ROCKSDB_8_X_COMMA(readopt)beg, caller);
+  uint64_t offset_end = ApproximateOffsetOf(ROCKSDB_8_X_COMMA(readopt)end, caller);
   return offset_end - offset_beg;
 }
 

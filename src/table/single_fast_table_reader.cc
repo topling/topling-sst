@@ -38,8 +38,8 @@ public:
               size_t compaction_readahead_size,
               bool allow_unprepared_value) final;
 
-  uint64_t ApproximateOffsetOf(const Slice& key, TableReaderCaller) final;
-  uint64_t ApproximateSize(const Slice&, const Slice&, TableReaderCaller) final;
+  uint64_t ApproximateOffsetOf(ROCKSDB_8_X_COMMA(const ReadOptions& readopt) const Slice& key, TableReaderCaller) final;
+  uint64_t ApproximateSize(ROCKSDB_8_X_COMMA(const ReadOptions& readopt) const Slice&, const Slice&, TableReaderCaller) final;
   void SetupForCompaction() final;
   void Prepare(const Slice& /*target*/) final;
   size_t ApproximateMemoryUsage() const final;
@@ -65,7 +65,9 @@ public:
   class RevIter;
 };
 
-uint64_t SingleFastTableReader::ApproximateOffsetOf(const Slice& ikey, TableReaderCaller) {
+uint64_t SingleFastTableReader::ApproximateOffsetOf(
+      ROCKSDB_8_X_COMMA(const ReadOptions& readopt)
+      const Slice& ikey, TableReaderCaller) {
   auto iter = (Patricia::Iterator*)iter_cache_.Get();
   if (UNLIKELY(!iter)) {
     iter = cspp_->new_iter();
@@ -83,7 +85,8 @@ uint64_t SingleFastTableReader::ApproximateOffsetOf(const Slice& ikey, TableRead
   }
   return file_data_.size_;
 }
-uint64_t SingleFastTableReader::ApproximateSize(const Slice& beg, const Slice& end,
+uint64_t SingleFastTableReader::ApproximateSize(ROCKSDB_8_X_COMMA(const ReadOptions& readopt)
+                                                const Slice& beg, const Slice& end,
                                                 TableReaderCaller) {
   auto iter = (Patricia::Iterator*)iter_cache_.Get();
   if (UNLIKELY(!iter)) {

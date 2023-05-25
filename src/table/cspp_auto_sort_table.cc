@@ -408,8 +408,8 @@ public:
               bool allow_unprepared_value) final;
 
   uint64_t ApproximateOffsetOf_impl(const Slice& key, Patricia::Iterator*);
-  uint64_t ApproximateOffsetOf(const Slice& key, TableReaderCaller) final;
-  uint64_t ApproximateSize(const Slice&, const Slice&, TableReaderCaller) final;
+  uint64_t ApproximateOffsetOf(ROCKSDB_8_X_COMMA(const ReadOptions& readopt) const Slice& key, TableReaderCaller) final;
+  uint64_t ApproximateSize(ROCKSDB_8_X_COMMA(const ReadOptions& readopt) const Slice&, const Slice&, TableReaderCaller) final;
   size_t ApproximateMemoryUsage() const final { return file_data_.size_; }
   Status Get(const ReadOptions& readOptions, const Slice& key,
                      GetContext* get_context,
@@ -453,14 +453,17 @@ uint64_t CSPPAutoSortTableReader::ApproximateOffsetOf_impl(const Slice& ikey, Pa
   }
   return file_data_.size_;
 }
-uint64_t CSPPAutoSortTableReader::ApproximateOffsetOf(const Slice& ikey, TableReaderCaller) {
+uint64_t CSPPAutoSortTableReader::ApproximateOffsetOf(
+      ROCKSDB_8_X_COMMA(const ReadOptions& readopt)
+      const Slice& ikey, TableReaderCaller) {
   if (!enableIndexRank_)
     return 0;
   Patricia::IteratorPtr iter(cspp_->new_iter());
   return ApproximateOffsetOf_impl(ikey, iter.get());
 }
-uint64_t CSPPAutoSortTableReader::ApproximateSize(const Slice& beg, const Slice& end,
-                                              TableReaderCaller) {
+uint64_t CSPPAutoSortTableReader::ApproximateSize(
+      ROCKSDB_8_X_COMMA(const ReadOptions& readopt)
+      const Slice& beg, const Slice& end, TableReaderCaller) {
   if (!enableIndexRank_)
     return 0;
   Patricia::IteratorPtr iter(cspp_->new_iter());

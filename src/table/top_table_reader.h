@@ -3,7 +3,7 @@
 //
 #pragma once
 
-#include <topling/json_fwd.h>
+#include <topling/side_plugin_repo.h>
 #include <rocksdb/file_system.h> // for FSRandomAccessFile
 #include <rocksdb/options.h>
 #include <rocksdb/table.h>
@@ -12,8 +12,6 @@
 #include <db/range_tombstone_fragmenter.h>
 
 namespace rocksdb {
-
-using nlohmann::json;
 
 ROCKSDB_ENUM_CLASS(WarmupLevel, unsigned char, kNone, kIndex, kValue);
 
@@ -102,8 +100,10 @@ public:
               bool allow_unprepared_value) override;
   Status Get(const ReadOptions&, const Slice& key, GetContext*,
              const SliceTransform*, bool skip_filters) override;
-  uint64_t ApproximateOffsetOf(const Slice&, TableReaderCaller) override { return 0; }
-  uint64_t ApproximateSize(const Slice&, const Slice&, TableReaderCaller) override { return 0; }
+  uint64_t ApproximateOffsetOf(ROCKSDB_8_X_COMMA(const ReadOptions& readopt)
+                               const Slice&, TableReaderCaller) override { return 0; }
+  uint64_t ApproximateSize(ROCKSDB_8_X_COMMA(const ReadOptions& readopt)
+                           const Slice&, const Slice&, TableReaderCaller) override { return 0; }
 
   void Open(RandomAccessFileReader*, Slice file_data, const TableReaderOptions&);
   std::string ToWebViewString(const json& dump_options) const override {

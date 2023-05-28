@@ -360,6 +360,13 @@ public:
     TERARK_ASSERT_LT(val_idx_, val_num_);
     return Slice(tab_->file_data_.data_ + val_pos_, val_len_); // NOLINT
   }
+  bool PrepareAndGetValue(Slice* v) final {
+    TERARK_ASSERT_GE(val_idx_, 0);
+    TERARK_ASSERT_LT(val_idx_, val_num_);
+    v->data_ = tab_->file_data_.data_ + val_pos_;
+    v->size_ = val_len_;
+    return true;
+  }
   Status status() const final { return Status::OK(); }
   bool IsKeyPinned() const final { return false; }
   bool IsValuePinned() const final { return true; }

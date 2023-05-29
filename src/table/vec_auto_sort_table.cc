@@ -1075,8 +1075,10 @@ public:
       result->SetKey(this->key());
       result->bound_check_result = IterBoundCheck::kUnknown;
       result->value_prepared = true;
+      result->is_valid = true;
       return true;
     }
+    result->is_valid = false;
     return false;
   }
 };
@@ -1147,8 +1149,10 @@ public:
       result->SetKey(this->key());
       result->bound_check_result = IterBoundCheck::kUnknown;
       result->value_prepared = true;
+      result->is_valid = true;
       return true;
     }
+    result->is_valid = false;
     return false;
   }
 };

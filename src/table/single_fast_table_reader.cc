@@ -373,12 +373,14 @@ public:
 
   bool NextAndGetResult(IterateResult* result) noexcept final {
     Next();
-    if (-1 != val_idx_) { // this->Valid()
+    if (LIKELY(val_idx_ >= 0)) { // this->Valid()
       result->SetKey(this->key());
       result->bound_check_result = IterBoundCheck::kUnknown;
       result->value_prepared = true;
+      result->is_valid = true;
       return true;
     }
+    result->is_valid = false;
     return false;
   }
 };

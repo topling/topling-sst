@@ -372,8 +372,7 @@ public:
   bool IsValuePinned() const final { return true; }
 
   bool NextAndGetResult(IterateResult* result) noexcept final {
-    Next();
-    if (LIKELY(val_idx_ >= 0)) { // this->Valid()
+    if (LIKELY(NextAndCheckValid())) {
       result->SetKey(this->key());
       result->bound_check_result = IterBoundCheck::kUnknown;
       result->value_prepared = true;
@@ -408,6 +407,9 @@ public:
       SetAtFirstValue();
   }
   void Next() final {
+    NextAndCheckValid(); // ignore return value
+  }
+  bool NextAndCheckValid() final {
     TERARK_ASSERT_GE(val_idx_, 0);
     TERARK_ASSERT_LE(val_idx_, val_num_);
     if (++val_idx_ < val_num_) {
@@ -416,15 +418,19 @@ public:
       unaligned_save(iter_->mutable_word().end(), seqvt);
       val_pos_ = pos_arr_[val_idx_];
       val_len_ = pos_arr_[val_idx_ + 1] - val_pos_;
-      return;
+      return true;
     }
     if (UNLIKELY(!iter_->incr())) {
       SetInvalid();
-      return;
+      return false;
     }
     SetAtFirstValue();
+    return true;
   }
   void Prev() final {
+    PrevAndCheckValid(); // ignore return value
+  }
+  bool PrevAndCheckValid() final {
     TERARK_ASSERT_GE(val_idx_, 0);
     TERARK_ASSERT_LE(val_idx_, val_num_);
     if (--val_idx_ >= 0) {
@@ -436,13 +442,14 @@ public:
       unaligned_save(iter_->mutable_word().end(), seqvt);
       val_pos_ = pos_arr_[val_idx_];
       val_len_ = pos_arr_[val_idx_ + 1] - val_pos_;
-      return;
+      return true;
     }
     if (UNLIKELY(!iter_->decr())) {
       SetInvalid();
-      return;
+      return false;
     }
     SetAtLastValue();
+    return true;
   }
 };
 class SingleFastTableReader::RevIter : public BaseIter {
@@ -476,6 +483,9 @@ public:
       SetAtFirstValue();
   }
   void Next() final {
+    NextAndCheckValid(); // ignore return value
+  }
+  bool NextAndCheckValid() final {
     TERARK_ASSERT_GE(val_idx_, 0);
     TERARK_ASSERT_LT(val_idx_, val_num_);
     if (++val_idx_ < val_num_) {
@@ -484,15 +494,19 @@ public:
       unaligned_save(iter_->mutable_word().end(), seqvt);
       val_pos_ = pos_arr_[val_idx_];
       val_len_ = pos_arr_[val_idx_ + 1] - val_pos_;
-      return;
+      return true;
     }
     if (UNLIKELY(!iter_->decr())) {
       SetInvalid();
-      return;
+      return false;
     }
     SetAtFirstValue();
+    return true;
   }
   void Prev() final {
+    PrevAndCheckValid(); // ignore return value
+  }
+  bool PrevAndCheckValid() final {
     TERARK_ASSERT_GE(val_idx_, 0);
     TERARK_ASSERT_LT(val_idx_, val_num_);
     if (--val_idx_ >= 0) {
@@ -504,13 +518,14 @@ public:
       unaligned_save(iter_->mutable_word().end(), seqvt);
       val_pos_ = pos_arr_[val_idx_];
       val_len_ = pos_arr_[val_idx_ + 1] - val_pos_;
-      return;
+      return true;
     }
     if (UNLIKELY(!iter_->incr())) {
       SetInvalid();
-      return;
+      return false;
     }
     SetAtLastValue();
+    return true;
   }
 };
 InternalIterator*

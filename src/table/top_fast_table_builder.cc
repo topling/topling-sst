@@ -81,6 +81,13 @@ TopFastTableBuilder::TopFastTableBuilder(
   properties_.compression_name = "TooFast";
 
   writeMethod_ = table_factory->table_options_.writeMethod;
+  // file_checksum_gen_factory must be null for non kRocksdbNative
+  if (ioptions_.file_checksum_gen_factory) {
+    if (WriteMethod::kRocksdbNative != writeMethod_) {
+      WARN(ioptions_.info_log, "file_checksum_gen_factory is not null, use kRocksdbNative");
+      writeMethod_ = WriteMethod::kRocksdbNative;
+    }
+  }
   if (WriteMethod::kToplingMmapWrite == writeMethod_) {
     // file_checksum_gen_factory must be null for non kRocksdbNative
     TERARK_VERIFY(nullptr == ioptions_.file_checksum_gen_factory);

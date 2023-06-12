@@ -41,8 +41,6 @@ TopTableBuilderBase::TopTableBuilderBase(const TableBuilderOptions& tbo,
     tbo.moptions.prefix_extractor->Name() : "nullptr";
 
   isReverseBytewiseOrder_ = !IsForwardBytewiseComparator(ioptions_.user_comparator);
-  // file_checksum_gen_factory must be null for non kRocksdbNative
-  TERARK_VERIFY(nullptr == ioptions_.file_checksum_gen_factory);
 
   if (tbo.int_tbl_prop_collector_factories) {
     const auto& factories = *tbo.int_tbl_prop_collector_factories;

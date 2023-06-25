@@ -830,6 +830,7 @@ struct TopTableReader_Manip : PluginManipFunc<TableReader> {
   }
 };
 // Register as compression algo name
+ROCKSDB_REG_PluginManip("ManyZip", TopTableReader_Manip);
 ROCKSDB_REG_PluginManip("FlatZip", TopTableReader_Manip);
 ROCKSDB_REG_PluginManip("TooZip", TopTableReader_Manip);
 ROCKSDB_REG_PluginManip("TooFast", TopTableReader_Manip);

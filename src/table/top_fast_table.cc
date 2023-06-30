@@ -198,6 +198,7 @@ struct TopFastTableFactory_Manip : PluginManipFunc<TableFactory> {
     if (auto t = dynamic_cast<TopFastTableFactory*>(p)) {
       auto o = (TopFastTableOptions_Json*)(&t->table_options_);
       o->Update(js, repo);
+      return;
     }
     std::string name = p->Name();
     THROW_InvalidArgument("Is not ToplingFastTable, but is: " + name);

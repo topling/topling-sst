@@ -75,6 +75,8 @@ struct TopFastTableOptions_Json : TopFastTableOptions {
     ROCKSDB_JSON_OPT_SIZE(js, fileWriteBufferSize);
     ROCKSDB_JSON_OPT_ENUM(js, warmupLevel);
     ROCKSDB_JSON_OPT_ENUM(js, writeMethod);
+    ROCKSDB_JSON_OPT_PROP(js, accurateKeyAnchorsSize);
+    ROCKSDB_JSON_OPT_SIZE(js, keyAnchorSizeUnit);
     ROCKSDB_JSON_OPT_PROP(js, useFilePreallocation);
     ROCKSDB_JSON_OPT_PROP(js, debugLevel);
   }
@@ -86,6 +88,8 @@ struct TopFastTableOptions_Json : TopFastTableOptions {
     ROCKSDB_JSON_SET_SIZE(djs, fileWriteBufferSize);
     ROCKSDB_JSON_SET_ENUM(djs, warmupLevel);
     ROCKSDB_JSON_SET_ENUM(djs, writeMethod);
+    ROCKSDB_JSON_SET_PROP(djs, accurateKeyAnchorsSize);
+    ROCKSDB_JSON_SET_SIZE(djs, keyAnchorSizeUnit);
     ROCKSDB_JSON_SET_PROP(djs, useFilePreallocation);
     ROCKSDB_JSON_SET_PROP(djs, debugLevel);
     return djs;

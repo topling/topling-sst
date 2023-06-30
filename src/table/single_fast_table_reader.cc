@@ -50,6 +50,9 @@ public:
 
   Status VerifyChecksum(const ReadOptions&, TableReaderCaller) final;
   bool GetRandomInternalKeysAppend(size_t num, std::vector<std::string>* output) const final;
+#if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 70060
+  Status ApproximateKeyAnchors(const ReadOptions&, std::vector<Anchor>&) override;
+#endif
   std::string FirstInternalKey(Slice user_key, MainPatricia::SingleReaderToken&) const;
 
   std::string ToWebViewString(const json& dump_options) const final;
@@ -59,6 +62,7 @@ public:
   union { ThreadLocalPtr iter_cache_; }; // for ApproximateOffsetOf
   size_t index_offset_; // also sum_value_len
   size_t index_size_;
+  const SingleFastTableFactory* factory_ = nullptr;
 
   class Iter;
   class BaseIter;
@@ -557,6 +561,51 @@ bool SingleFastTableReader::GetRandomInternalKeysAppend(
   return true;
 }
 
+#if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 70060
+Status SingleFastTableReader::
+ApproximateKeyAnchors(const ReadOptions& ro, std::vector<Anchor>& anchors) {
+  if (!factory_->table_options_.accurateKeyAnchorsSize) {
+    return TopTableReaderBase::ApproximateKeyAnchors(ro, anchors);
+  }
+  size_t an_num = 256;
+  if (size_t keyAnchorSizeUnit = factory_->table_options_.keyAnchorSizeUnit) {
+    size_t units = file_data_.size_ / keyAnchorSizeUnit;
+    an_num = std::min<size_t>(units, 10000);
+    an_num = std::max<size_t>(an_num, 256);
+  }
+  SortableStrVec keys;
+  cspp_->dfa_get_random_keys(&keys, std::min(cspp_->num_words(), an_num));
+  keys.sort();
+  if (isReverseBytewiseOrder_) {
+    std::reverse(keys.m_index.begin(), keys.m_index.end());
+  }
+  MainPatricia::SingleReaderToken token(cspp_);
+  double sum_val_len = index_offset_ + 1.0;
+  double coefficient = file_data_.size_ / sum_val_len;
+  size_t prev_offset = 0;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    while (i + 1 < keys.size() && keys[i] == keys[i + 1]) {
+      i++; // skip dup key
+    }
+    Slice user_key = SliceOf(keys[i]);
+    TERARK_VERIFY(token.trie()->lookup(user_key, &token));
+    auto entry = token.value_of<TopFastIndexEntry>();
+    size_t val_pos = entry.valueMul
+                   ? aligned_load<uint32_t>(cspp_->mem_get(entry.valuePos))
+                   : entry.valuePos;
+    size_t curr_offset = val_pos * coefficient;
+    if (curr_offset > prev_offset) {
+      anchors.push_back({user_key, curr_offset - prev_offset});
+      prev_offset = curr_offset;
+    }
+    else if (curr_offset && curr_offset == prev_offset) {
+      STD_WARN("ApproximateKeyAnchors: same offset = %zd", curr_offset);
+    }
+  }
+  return Status::OK();
+}
+#endif
+
 std::string SingleFastTableReader::FirstInternalKey(
         Slice user_key, MainPatricia::SingleReaderToken& token) const {
   TERARK_VERIFY(token.trie()->lookup(user_key, &token));
@@ -687,6 +736,7 @@ const try {
   }
   auto t = new SingleFastTableReader();
   table->reset(t);
+  t->factory_ = this;
   t->Open(file.release(), file_data, tro, table_options_.warmupLevel);
   as_atomic(num_readers_).fetch_add(1, std::memory_order_relaxed);
   return Status::OK();

@@ -20,8 +20,11 @@ struct TopFastTableOptions {
   std::string indexType;
   size_t keyPrefixLen = 0;
   uint32_t fileWriteBufferSize = 8 * 1024;
+  uint32_t keyAnchorSizeUnit = 0;
+//uint32_t maxKeyAnchorsPerFile = 0;
   WarmupLevel warmupLevel = WarmupLevel::kValue;
   WriteMethod writeMethod = WriteMethod::kToplingFileWrite;
+  bool accurateKeyAnchorsSize = true;
   bool useFilePreallocation = true;
   int debugLevel = 0;
 };

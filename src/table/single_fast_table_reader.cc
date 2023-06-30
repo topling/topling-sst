@@ -83,7 +83,7 @@ uint64_t SingleFastTableReader::ApproximateOffsetOf(
     size_t val_pos = entry.valueMul
                   ? aligned_load<uint32_t>(cspp_->mem_get(entry.valuePos))
                   : entry.valuePos;
-    double sum_val_len = index_offset_ + 1.0;
+    double sum_val_len = std::max<double>(index_offset_, 1.0);
     double coefficient = file_data_.size_ / sum_val_len;
     return val_pos * coefficient;
   }
@@ -99,7 +99,7 @@ uint64_t SingleFastTableReader::ApproximateSize(ROCKSDB_8_X_COMMA(const ReadOpti
   }
   fstring ukeyBeg(beg.data_, beg.size_ - 8);
   fstring ukeyEnd(end.data_, end.size_ - 8);
-  double sum_val_len = index_offset_ + 1.0;
+  double sum_val_len = std::max<double>(index_offset_, 1.0);
   double coefficient = file_data_.size_ / sum_val_len;
   size_t vposBeg = index_offset_, vposEnd = index_offset_;
   if (iter->seek_lower_bound(ukeyBeg)) {
@@ -580,7 +580,7 @@ ApproximateKeyAnchors(const ReadOptions& ro, std::vector<Anchor>& anchors) {
     std::reverse(keys.m_index.begin(), keys.m_index.end());
   }
   MainPatricia::SingleReaderToken token(cspp_);
-  double sum_val_len = index_offset_ + 1.0;
+  double sum_val_len = std::max<double>(index_offset_, 1.0);
   double coefficient = file_data_.size_ / sum_val_len;
   size_t prev_offset = 0;
   for (size_t i = 0; i < keys.size(); ++i) {

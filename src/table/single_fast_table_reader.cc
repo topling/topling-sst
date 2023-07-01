@@ -57,6 +57,25 @@ public:
 
   std::string ToWebViewString(const json& dump_options) const final;
 
+  Patricia::Iterator* TLS_Iter() {
+    auto iter = (Patricia::Iterator*)iter_cache_.Get();
+    if (UNLIKELY(!iter)) {
+      iter = cspp_->new_iter();
+      iter_cache_.Reset(iter);
+    }
+    return iter;
+  }
+  size_t FirstValuePos(const Patricia::TokenBase& token) const {
+    auto entry = cspp_->value_of<TopFastIndexEntry>(token);
+    return entry.valueMul
+           ? aligned_load<uint32_t>(cspp_->mem_get(entry.valuePos))
+           : entry.valuePos;
+  }
+  double SizeCoefficient() const {
+    double sum_val_len = std::max<double>(index_offset_, 1.0);
+    return file_data_.size_ / sum_val_len;
+  }
+
 // data member also public
   MainPatricia* cspp_ = nullptr;
   union { ThreadLocalPtr iter_cache_; }; // for ApproximateOffsetOf
@@ -72,45 +91,26 @@ public:
 uint64_t SingleFastTableReader::ApproximateOffsetOf(
       ROCKSDB_8_X_COMMA(const ReadOptions& readopt)
       const Slice& ikey, TableReaderCaller) {
-  auto iter = (Patricia::Iterator*)iter_cache_.Get();
-  if (UNLIKELY(!iter)) {
-    iter = cspp_->new_iter();
-    iter_cache_.Reset(iter);
-  }
+  auto iter = TLS_Iter();
   fstring user_key(ikey.data(), ikey.size() - 8);
   if (iter->seek_lower_bound(user_key)) {
-    auto entry = iter->value_of<TopFastIndexEntry>();
-    size_t val_pos = entry.valueMul
-                  ? aligned_load<uint32_t>(cspp_->mem_get(entry.valuePos))
-                  : entry.valuePos;
-    double sum_val_len = std::max<double>(index_offset_, 1.0);
-    double coefficient = file_data_.size_ / sum_val_len;
-    return val_pos * coefficient;
+    return FirstValuePos(*iter) * SizeCoefficient();
   }
   return file_data_.size_;
 }
 uint64_t SingleFastTableReader::ApproximateSize(ROCKSDB_8_X_COMMA(const ReadOptions& readopt)
                                                 const Slice& beg, const Slice& end,
                                                 TableReaderCaller) {
-  auto iter = (Patricia::Iterator*)iter_cache_.Get();
-  if (UNLIKELY(!iter)) {
-    iter = cspp_->new_iter();
-    iter_cache_.Reset(iter);
-  }
+  auto iter = TLS_Iter();
   fstring ukeyBeg(beg.data_, beg.size_ - 8);
   fstring ukeyEnd(end.data_, end.size_ - 8);
-  double sum_val_len = std::max<double>(index_offset_, 1.0);
-  double coefficient = file_data_.size_ / sum_val_len;
+  double coefficient = SizeCoefficient();
   size_t vposBeg = index_offset_, vposEnd = index_offset_;
   if (iter->seek_lower_bound(ukeyBeg)) {
-    auto en = iter->value_of<TopFastIndexEntry>();
-    vposBeg = en.valueMul ? aligned_load<uint32_t>(cspp_->mem_get(en.valuePos))
-            : en.valuePos;
+    vposBeg = FirstValuePos(*iter);
   }
   if (iter->seek_lower_bound(ukeyEnd)) {
-    auto en = iter->value_of<TopFastIndexEntry>();
-    vposEnd = en.valueMul ? aligned_load<uint32_t>(cspp_->mem_get(en.valuePos))
-            : en.valuePos;
+    vposEnd = FirstValuePos(*iter);
   }
   if (vposBeg < vposEnd)
     return uint64_t(coefficient * (vposEnd - vposBeg));
@@ -142,7 +142,7 @@ Status SingleFastTableReader::Get(const ReadOptions& readOptions,
     return st;
   }
   bool const just_check_key_exists = readOptions.just_check_key_exists;
-  auto entry = token.value_of<TopFastIndexEntry>();
+  auto entry = cspp_->value_of<TopFastIndexEntry>(token);
   const SequenceNumber finding_seq = pikey.sequence;
   Slice val;
   Cleanable noop_pinner;
@@ -579,21 +579,19 @@ ApproximateKeyAnchors(const ReadOptions& ro, std::vector<Anchor>& anchors) {
   if (isReverseBytewiseOrder_) {
     std::reverse(keys.m_index.begin(), keys.m_index.end());
   }
-  MainPatricia::SingleReaderToken token(cspp_);
-  double sum_val_len = std::max<double>(index_offset_, 1.0);
-  double coefficient = file_data_.size_ / sum_val_len;
+  auto iter = TLS_Iter();
+  anchors.reserve(keys.size() + 1);
+  double coefficient = SizeCoefficient();
   size_t prev_offset = 0;
   for (size_t i = 0; i < keys.size(); ++i) {
     while (i + 1 < keys.size() && keys[i] == keys[i + 1]) {
       i++; // skip dup key
     }
     Slice user_key = SliceOf(keys[i]);
-    TERARK_VERIFY(token.trie()->lookup(user_key, &token));
-    auto entry = token.value_of<TopFastIndexEntry>();
-    size_t val_pos = entry.valueMul
-                   ? aligned_load<uint32_t>(cspp_->mem_get(entry.valuePos))
-                   : entry.valuePos;
+    TERARK_VERIFY(cspp_->lookup(user_key, iter));
+    size_t val_pos = FirstValuePos(*iter);
     size_t curr_offset = val_pos * coefficient;
+    ROCKSDB_VERIFY_GE(curr_offset, prev_offset);
     if (curr_offset > prev_offset) {
       anchors.push_back({user_key, curr_offset - prev_offset});
       prev_offset = curr_offset;
@@ -602,14 +600,25 @@ ApproximateKeyAnchors(const ReadOptions& ro, std::vector<Anchor>& anchors) {
       STD_WARN("ApproximateKeyAnchors: same offset = %zd", curr_offset);
     }
   }
+  if (isReverseBytewiseOrder_) {
+    ROCKSDB_VERIFY(iter->seek_begin());
+  } else {
+    ROCKSDB_VERIFY(iter->seek_end());
+  }
+  Slice largest_user_key = SliceOf(iter->word());
+  if (UNLIKELY(keys.size() && SliceOf(keys.back()) != largest_user_key)) {
+    size_t val_pos = FirstValuePos(*iter);
+    size_t curr_offset = val_pos * coefficient;
+    anchors.push_back({largest_user_key, curr_offset - prev_offset});
+  }
   return Status::OK();
 }
 #endif
 
 std::string SingleFastTableReader::FirstInternalKey(
         Slice user_key, MainPatricia::SingleReaderToken& token) const {
-  TERARK_VERIFY(token.trie()->lookup(user_key, &token));
-  auto entry = token.value_of<TopFastIndexEntry>();
+  TERARK_VERIFY(cspp_->lookup(user_key, &token));
+  auto entry = cspp_->value_of<TopFastIndexEntry>(token);
   std::string ikey;
   ikey.reserve(user_key.size_ + 8);
   ikey.append(user_key.data_, user_key.size_);

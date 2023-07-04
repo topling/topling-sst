@@ -63,6 +63,8 @@ public:
   ushort minUserKeyLen = 0; // now just used for runtime verify
   bool forceNeedCompact = true;
   bool collectProperties = true;
+  bool accurateKeyAnchorsSize = false; // default disable
+  uint32_t keyAnchorSizeUnit = 0;
   int debugLevel = 0;
 
   // stats
@@ -729,6 +731,9 @@ public:
 
   Status VerifyChecksum(const ReadOptions&, TableReaderCaller) final;
   bool GetRandomInternalKeysAppend(size_t num, std::vector<std::string>* output) const final;
+#if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 70060
+  Status ApproximateKeyAnchors(const ReadOptions&, std::vector<Anchor>&) override;
+#endif
   std::string ToWebViewString(const json& dump_options) const final;
 
 // data member also public
@@ -1206,6 +1211,66 @@ bool VecAutoSortTableReader::GetRandomInternalKeysAppend(
   return true;
 }
 
+#if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 70060
+Status VecAutoSortTableReader::ApproximateKeyAnchors
+            (const ReadOptions& ro, std::vector<Anchor>& anchors) {
+  if (!factory_->accurateKeyAnchorsSize) {
+    return TopTableReaderBase::ApproximateKeyAnchors(ro, anchors);
+  }
+  size_t an_num = 256;
+  if (size_t keyAnchorSizeUnit = factory_->keyAnchorSizeUnit) {
+    size_t units = file_data_.size_ / keyAnchorSizeUnit;
+    an_num = std::min<size_t>(units, 10000);
+    an_num = std::max<size_t>(an_num, 256);
+  }
+  const size_t entries = table_properties_->num_entries;
+  an_num = std::min(an_num, entries);
+  anchors.reserve(an_num);
+  const auto step = double(entries) / an_num;
+  const auto fixed_key_len = fixed_key_len_;
+  const auto fixed_value_len = fixed_value_len_;
+  const auto pref_len = pref_len_;
+  const byte_t* index_base = fstrvec_.m_strpool.data();
+  const size_t fixed_suffix_len = fixed_key_len - pref_len - 8;
+  const size_t fixlen = fixed_suffix_len + 4;
+  size_t prev_key_offset = 0, prev_val_offset = 0;
+  for (size_t i = 0; i < an_num; ++i) {
+    const size_t r = std::min(size_t(step * i), entries - 1);
+    fstring suffix;
+    size_t curr_key_offset, curr_val_offset; // end offset
+    if (fixed_key_len) {
+      if (fixed_value_len >= 0) {
+        suffix = fstrvec_[r].prefix(fixed_key_len).str();
+        curr_key_offset = (r+1) * fixed_key_len;
+        curr_val_offset = (r+1) * fixed_value_len;
+      } else {
+        suffix = fstrvec_[r].notail(sizeof(uint32_t)).str();
+        curr_key_offset = (r+1) * fixed_key_len;
+        curr_val_offset = unaligned_load<uint32_t>(index_base + fixlen * (r + 2) - 4);
+      }
+    } else {
+      if (fixed_value_len >= 0) {
+        suffix = ssvec_[r];
+        curr_key_offset = ssvec_.m_offsets[r+1];
+        curr_val_offset = (r+1) * fixed_value_len;
+      } else {
+        suffix = vkvv_.key(r);
+        curr_key_offset = vkvv_.kvoffsets[r+1].key;
+        curr_val_offset = vkvv_.kvoffsets[r+1].val;
+      }
+    }
+    std::string ukey;
+    ukey.reserve(pref_len + suffix.size());
+    ukey.append((char*)sstmeta_->common_prefix, pref_len);
+    ukey.append(suffix.data(), suffix.size());
+    auto curr_kv = curr_key_offset + curr_val_offset;
+    auto prev_kv = prev_key_offset + prev_val_offset;
+    anchors.push_back({ukey, curr_kv - prev_kv});
+  }
+  return Status::OK();
+}
+#endif
+
 std::string VecAutoSortTableReader::ToWebViewString(const json& dump_options) const {
   return "VecAutoSortTableReader::ToWebViewString: to be done";
 }
@@ -1334,6 +1399,8 @@ void VecAutoSortTableFactory::Update(const json&, const json& js, const SidePlug
   ROCKSDB_JSON_OPT_SIZE(js, fileWriteBufferSize);
   ROCKSDB_JSON_OPT_PROP(js, collectProperties);
   ROCKSDB_JSON_OPT_PROP(js, forceNeedCompact);
+  ROCKSDB_JSON_OPT_PROP(js, accurateKeyAnchorsSize);
+  ROCKSDB_JSON_OPT_SIZE(js, keyAnchorSizeUnit);
   ROCKSDB_JSON_OPT_PROP(js, debugLevel);
   ROCKSDB_JSON_OPT_PROP(js, minUserKeyLen);
 }
@@ -1367,6 +1434,8 @@ std::string VecAutoSortTableFactory::ToString(const json &dump_options,
   ROCKSDB_JSON_SET_SIZE(djs, fileWriteBufferSize);
   ROCKSDB_JSON_SET_PROP(djs, collectProperties);
   ROCKSDB_JSON_SET_PROP(djs, forceNeedCompact);
+  ROCKSDB_JSON_SET_PROP(djs, accurateKeyAnchorsSize);
+  ROCKSDB_JSON_SET_SIZE(djs, keyAnchorSizeUnit);
   ROCKSDB_JSON_SET_PROP(djs, debugLevel);
   djs["num_writers"] = num_writers_;
   djs["num_readers"] = num_readers_;

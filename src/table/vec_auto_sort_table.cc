@@ -791,6 +791,15 @@ public:
       else
         return vkvv_[idx];
   }
+  size_t NumUserKeys() const {
+    if (fixed_key_len_) {
+      return fstrvec_.size();
+    } else if (fixed_value_len_ >= 0) {
+      return ssvec_.size();
+    } else {
+      return vkvv_.size();
+    }
+  }
   union {
     FixedLenStrVec fstrvec_; // fixed key any value
     SortedStrVec   ssvec_;   // vkfv: var key fixed value
@@ -1182,12 +1191,14 @@ VecAutoSortTableReader::NewIterator(const ReadOptions& ro,
 
 bool VecAutoSortTableReader::GetRandomInternalKeysAppend(
                   size_t num, std::vector<std::string>* output) const {
-  SortableStrVec keys;
-  auto seed = num + size_t(output) + size_t(this);
-  std::mt19937_64 rnd(seed);
-  const size_t entries = table_properties_->num_entries;
+  if (0 == num) {
+    return true;
+  }
+  const size_t num_ukeys = NumUserKeys();
+  num = std::min(num, num_ukeys);
+  const auto step = double(num_ukeys) / num;
   for (size_t i = 0; i < num; ++i) {
-    size_t r = rnd() % entries;
+    const size_t r = std::min(size_t(step * i), num_ukeys - 1);
     fstring ukey;
     if (fixed_key_len_) {
       if (fixed_value_len_ >= 0)
@@ -1206,7 +1217,7 @@ bool VecAutoSortTableReader::GetRandomInternalKeysAppend(
     ikey.append((char*)sstmeta_->common_prefix, pref_len_);
     ikey.append(ukey.data(), ukey.size());
     ikey.append((char*)&seqvt, sizeof(seqvt));
-    output->push_back(ikey);
+    output->push_back(std::move(ikey));
   }
   return true;
 }
@@ -1223,10 +1234,10 @@ Status VecAutoSortTableReader::ApproximateKeyAnchors
     an_num = std::min<size_t>(units, 10000);
     an_num = std::max<size_t>(an_num, 256);
   }
-  const size_t entries = table_properties_->num_entries;
-  an_num = std::min(an_num, entries);
+  const size_t num_ukeys = NumUserKeys();
+  an_num = std::min(an_num, num_ukeys);
   anchors.reserve(an_num);
-  const auto step = double(entries) / an_num;
+  const auto step = double(num_ukeys) / an_num;
   const auto fixed_key_len = fixed_key_len_;
   const auto fixed_value_len = fixed_value_len_;
   const auto pref_len = pref_len_;
@@ -1235,7 +1246,7 @@ Status VecAutoSortTableReader::ApproximateKeyAnchors
   const size_t fixlen = fixed_suffix_len + 4;
   size_t prev_key_offset = 0, prev_val_offset = 0;
   for (size_t i = 0; i < an_num; ++i) {
-    const size_t r = std::min(size_t(step * i), entries - 1);
+    const size_t r = std::min(size_t(step * i), num_ukeys - 1);
     fstring suffix;
     size_t curr_key_offset, curr_val_offset; // end offset
     if (fixed_key_len) {
@@ -1265,7 +1276,7 @@ Status VecAutoSortTableReader::ApproximateKeyAnchors
     ukey.append(suffix.data(), suffix.size());
     auto curr_kv = curr_key_offset + curr_val_offset;
     auto prev_kv = prev_key_offset + prev_val_offset;
-    anchors.push_back({ukey, curr_kv - prev_kv});
+    anchors.push_back({std::move(ukey), curr_kv - prev_kv});
   }
   return Status::OK();
 }

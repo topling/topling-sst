@@ -276,6 +276,10 @@ void SingleFastTableBuilder::WriteValue(uint64_t seqvt, const Slice& value) {
     valueNodeVec_[0].pos++; // adjust the pos to make posArr satisfy:
                             // valueLen[i] = posArr[i+1] - posArr[i]
   }
+  if (offset_ >= UINT32_MAX) {
+    ROCKSDB_DIE("file size if too large, value offset must < 4G, but is %lld",
+                (long long)(offset_));
+  }
   if (seqvt >> 8) {
     is_all_seqno_zero_ = false;
   }

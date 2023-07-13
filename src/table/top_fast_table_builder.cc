@@ -477,6 +477,8 @@ const {
                   tbo.ioptions.user_comparator->Name());
   if (0 == as_atomic(num_writers_).fetch_add(1, std::memory_order_relaxed)) {
     start_time_point_ = g_pf.now();
+    WARN(tbo.ioptions.info_log,
+        "ToplingFastTable is deprecated, use SingleFastTable instead");
   }
   return new TopFastTableBuilder(this, tbo, file);
 }

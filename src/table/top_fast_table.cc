@@ -80,8 +80,7 @@ struct TopFastTableOptions_Json : TopFastTableOptions {
     ROCKSDB_JSON_OPT_PROP(js, useFilePreallocation);
     ROCKSDB_JSON_OPT_PROP(js, debugLevel);
   }
-  json ToJson(const json& dump_options, const SidePluginRepo&) const {
-    json djs;
+  void ToJson(json& djs, const json& dump_options, const SidePluginRepo&) const {
     //ROCKSDB_JSON_SET_PROP(djs, compressionThreshold);
     ROCKSDB_JSON_SET_PROP(djs, indexType);
     ROCKSDB_JSON_SET_PROP(djs, keyPrefixLen);
@@ -92,7 +91,6 @@ struct TopFastTableOptions_Json : TopFastTableOptions {
     ROCKSDB_JSON_SET_SIZE(djs, keyAnchorSizeUnit);
     ROCKSDB_JSON_SET_PROP(djs, useFilePreallocation);
     ROCKSDB_JSON_SET_PROP(djs, debugLevel);
-    return djs;
   }
 };
 static
@@ -208,7 +206,14 @@ struct TopFastTableFactory_Manip : PluginManipFunc<TableFactory> {
     if (auto t = dynamic_cast<const TopFastTableFactory*>(&fac)) {
       // damn! GetOptions is not const, use 'm' for mutable ptr
       auto o = (TopFastTableOptions_Json*)(&t->table_options_);
-      auto djs = o->ToJson(dump_options, repo);
+      json djs;
+      djs["document"] = (dynamic_cast<const SingleFastTableFactory*>(t))
+        ? "<a href='https://github.com/topling/sideplugin-wiki-en/wiki/SingleFastTable'>Document(English)</a> | "
+          "<a href='https://github.com/topling/rockside/wiki/SingleFastTable'>文档（中文）</a>"
+        : "<a href='https://github.com/topling/sideplugin-wiki-en/wiki/ToplingFastTable'>Document(English)</a> | "
+          "<a href='https://github.com/topling/rockside/wiki/ToplingFastTable'>文档（中文）</a>"
+        ;
+      o->ToJson(djs, dump_options, repo);
       bool html = JsonSmartBool(dump_options, "html", true);
       static_cast<const TopFastTableFactory_Json*>(t)->ToJson(djs, html);//NOLINT
       return JsonToString(djs, dump_options);

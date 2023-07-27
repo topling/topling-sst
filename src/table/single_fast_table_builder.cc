@@ -276,8 +276,8 @@ void SingleFastTableBuilder::WriteValue(uint64_t seqvt, const Slice& value) {
     valueNodeVec_[0].pos++; // adjust the pos to make posArr satisfy:
                             // valueLen[i] = posArr[i+1] - posArr[i]
   }
-  if (offset_ >= UINT32_MAX) {
-    ROCKSDB_DIE("file size if too large, value offset must < 4G, but is %lld",
+  if (UNLIKELY(offset_ >= UINT32_MAX)) {
+    ROCKSDB_DIE("file size is too large, value offset must < 4G, but is %lld",
                 (long long)(offset_));
   }
   if (seqvt >> 8) {
@@ -289,7 +289,7 @@ void SingleFastTableBuilder::WriteValue(uint64_t seqvt, const Slice& value) {
 const uint64_t kSingleFastTableMagic = 0x747361466c676e53; // SnglFast
 
 Status SingleFastTableBuilder::Finish() try {
-  if (0 == num_user_key_) {
+  if (UNLIKELY(0 == num_user_key_)) {
     FinishAsEmptyTable();
     return Status::OK();
   }

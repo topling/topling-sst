@@ -835,6 +835,7 @@ ROCKSDB_REG_PluginManip("FlatZip", TopTableReader_Manip);
 ROCKSDB_REG_PluginManip("TooZip", TopTableReader_Manip);
 ROCKSDB_REG_PluginManip("TooFast", TopTableReader_Manip);
 ROCKSDB_REG_PluginManip("SngFast", TopTableReader_Manip);
+ROCKSDB_REG_PluginManip("CSPPMemTab", TopTableReader_Manip);
 
 
 } // ROCKSDB_NAMESPACE

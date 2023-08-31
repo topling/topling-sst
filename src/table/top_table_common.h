@@ -69,27 +69,6 @@ const std::string kPropertiesBlock = "rocksdb.properties";
 const std::string kRangeDelBlock = "rocksdb.range_del";
 #endif
 
-template<class ByteArray>
-inline Slice SliceOf(const ByteArray& ba) {
-  static_assert(sizeof(ba[0]) == 1);
-  return Slice((const char*)ba.data(), ba.size());
-}
-
-template<class ByteArray>
-inline Slice SubSlice(const ByteArray& x, size_t pos) {
-  static_assert(sizeof(x.data()[0]) == 1, "ByteArray elem size must be 1");
-  TERARK_ASSERT_LE(pos, x.size());
-  return Slice((const char*)x.data() + pos, x.size() - pos);
-}
-
-template<class ByteArray>
-inline Slice SubSlice(const ByteArray& x, size_t pos, size_t len) {
-  static_assert(sizeof(x.data()[0]) == 1, "ByteArray elem size must be 1");
-  TERARK_ASSERT_LE(pos, x.size());
-  TERARK_ASSERT_LE(pos + len, x.size());
-  return Slice((const char*)x.data() + pos, len);
-}
-
 inline uint64_t ReadBigEndianUint64(const void* beg, size_t len) {
   TOPLING_SST_ASSUME(len <= 8);
   union {

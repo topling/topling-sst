@@ -718,8 +718,11 @@ void SingleFastTableReader::Open(RandomAccessFileReader* file, Slice file_data,
   if (!props->compression_options.empty()) {
     props->compression_options += ";";
   }
-  props->compression_options += "Unused = ";
+  props->compression_options += "Free = ";
   props->compression_options += SizeToString(cspp_->mem_frag_size());
+  char buf[32];
+  auto len = sprintf(buf, ", %.2f%%", 100.0*cspp_->mem_frag_size()/file_size);
+  props->compression_options.append(buf, len);
 }
 
 SingleFastTableReader::~SingleFastTableReader() {

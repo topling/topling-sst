@@ -715,6 +715,11 @@ void SingleFastTableReader::Open(RandomAccessFileReader* file, Slice file_data,
                 header->magic + " : " + header->class_name);
   }
   dfa.release(); // NOLINT
+  if (!props->compression_options.empty()) {
+    props->compression_options += ";";
+  }
+  props->compression_options += "Unused = ";
+  props->compression_options += SizeToString(cspp_->mem_frag_size());
 }
 
 SingleFastTableReader::~SingleFastTableReader() {

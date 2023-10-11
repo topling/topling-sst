@@ -59,6 +59,7 @@ public:
   MainPatricia cspp_;
   MainPatricia::SingleWriterToken wtoken_;
   valvec<byte_t> prevUserKey_;
+  std::map<uint32_t, uint32_t> dupLenHistogram_, ukeyLenHistogram_, valueLenHistogram_;
   OsFileStream fstream_;
   OutputBuffer fobuf_;
   MemMapStream fmap_;
@@ -235,6 +236,7 @@ void SingleFastTableBuilder::FinishPrevUserKey() {
     entry.valueLen = uint32_t(prev_value_len_);
     entry.valueMul = 0;
   }
+  dupLenHistogram_[uint32_t(valueNum)]++;
   TERARK_VERIFY(cspp_.insert(prevUserKey_, &entry, &wtoken_));
   TERARK_VERIFY(wtoken_.has_value());
   valueNodeVec_.erase_all();

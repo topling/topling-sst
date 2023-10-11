@@ -13,6 +13,7 @@
 
 namespace rocksdb {
 
+using terark::StrDateTimeNow;
 #define LOG_POS_ARGS rocksdb::StrDateTimeNow(), RocksLogShorterFileName(__FILE__), __LINE__
 #define STD_INFO(format, ...) fprintf(stderr, "%s INFO: %s:%d: " format "\n", LOG_POS_ARGS, ##__VA_ARGS__)
 #define STD_WARN(format, ...) fprintf(stderr, "%s WARN: %s:%d: " format "\n", LOG_POS_ARGS, ##__VA_ARGS__)
@@ -127,7 +128,6 @@ T abs_diff(const T& x, const T& y) {
     return x - y;
 }
 
-const char* StrDateTimeNow();
 std::string demangle(const char* name);
 
 template<class T>

@@ -77,7 +77,7 @@ public:
   }
 
 // data member also public
-  MainPatricia* cspp_ = nullptr;
+  mutable MainPatricia cspp_[1]; // be pointer-like, to minimize code changes
   union { ThreadLocalPtr iter_cache_; }; // for ApproximateOffsetOf
   size_t index_offset_; // also sum_value_len
   size_t index_size_;
@@ -706,15 +706,7 @@ void SingleFastTableReader::Open(RandomAccessFileReader* file, Slice file_data,
   if (WarmupLevel::kIndex == warmupLevel) {
     MmapWarmUp(indexBlock.data);
   }
-  auto dfa = UniquePtrOf(BaseDFA::load_mmap_user_mem(indexBlock.data));
-  cspp_ = dynamic_cast<MainPatricia*>(dfa.get());
-  if (!cspp_) {
-    auto header = reinterpret_cast<const ToplingIndexHeader*>(indexBlock.data.data_);
-    throw Status::Corruption(ROCKSDB_FUNC,
-              std::string("dfa is not MainPatricia, but is: ") +
-                header->magic + " : " + header->class_name);
-  }
-  dfa.release(); // NOLINT
+  cspp_->self_mmap_user_mem(indexBlock.data);
   if (!props->compression_options.empty()) {
     props->compression_options += ";";
   }
@@ -728,7 +720,6 @@ void SingleFastTableReader::Open(RandomAccessFileReader* file, Slice file_data,
 SingleFastTableReader::~SingleFastTableReader() {
   TERARK_VERIFY_F(0 == live_iter_num_, "real: %zd", live_iter_num_);
   iter_cache_.~ThreadLocalPtr(); // destruct before cspp_
-  delete cspp_;
 }
 
 Status

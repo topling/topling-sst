@@ -58,7 +58,7 @@ public:
   size_t max_val_len = 0, min_val_len = SIZE_MAX;
   MainPatricia cspp_;
   MainPatricia::SingleWriterToken wtoken_;
-  valvec<byte_t> prevUserKey_;
+  valvec<char> prevUserKey_;
   OsFileStream fstream_;
   OutputBuffer fobuf_;
   MemMapStream fmap_;

@@ -26,6 +26,9 @@ struct TopFastTableOptions {
   WriteMethod writeMethod = WriteMethod::kToplingFileWrite;
   bool accurateKeyAnchorsSize = true;
   bool useFilePreallocation = true;
+  int minPreadLen   =    -1; // only for SingleFastTableReader::Get
+  int maxPreadLen   = 32768; // only for SingleFastTableReader::Get
+  int minPreadLevel =     2; // only for SingleFastTableReader::Get
   int debugLevel = 0;
 };
 

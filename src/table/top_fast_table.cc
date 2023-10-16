@@ -78,6 +78,9 @@ struct TopFastTableOptions_Json : TopFastTableOptions {
     ROCKSDB_JSON_OPT_PROP(js, accurateKeyAnchorsSize);
     ROCKSDB_JSON_OPT_SIZE(js, keyAnchorSizeUnit);
     ROCKSDB_JSON_OPT_PROP(js, useFilePreallocation);
+    ROCKSDB_JSON_OPT_SIZE(js, minPreadLen);
+    ROCKSDB_JSON_OPT_SIZE(js, maxPreadLen);
+    ROCKSDB_JSON_OPT_PROP(js, minPreadLevel);
     ROCKSDB_JSON_OPT_PROP(js, debugLevel);
   }
   void ToJson(json& djs, const json& dump_options, const SidePluginRepo&) const {
@@ -90,6 +93,9 @@ struct TopFastTableOptions_Json : TopFastTableOptions {
     ROCKSDB_JSON_SET_PROP(djs, accurateKeyAnchorsSize);
     ROCKSDB_JSON_SET_SIZE(djs, keyAnchorSizeUnit);
     ROCKSDB_JSON_SET_PROP(djs, useFilePreallocation);
+    ROCKSDB_JSON_SET_SIZE(djs, minPreadLen);
+    ROCKSDB_JSON_SET_SIZE(djs, maxPreadLen);
+    ROCKSDB_JSON_SET_PROP(djs, minPreadLevel);
     ROCKSDB_JSON_SET_PROP(djs, debugLevel);
   }
 };

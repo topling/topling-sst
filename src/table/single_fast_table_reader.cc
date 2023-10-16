@@ -15,6 +15,8 @@
 #include <table/meta_blocks.h>
 #include <util/thread_local.h>
 #include <terark/fsa/cspptrie.inl>
+#include <terark/num_to_str.hpp>
+#include <terark/thread/fiber_aio.hpp>
 #include <terark/util/sortable_strvec.hpp>
 #include <topling/side_plugin_factory.h>
 #include <topling/builtin_table_factory.h>
@@ -43,6 +45,9 @@ public:
   void SetupForCompaction() final;
   void Prepare(const Slice& /*target*/) final;
   size_t ApproximateMemoryUsage() const final;
+
+  bool ReadValue(Slice* val, size_t len, size_t offset,
+                 const ReadOptions&, Cleanable* pinner, Status*);
   Status Get(const ReadOptions& readOptions, const Slice& key,
                      GetContext* get_context,
                      const SliceTransform* prefix_extractor,
@@ -77,6 +82,9 @@ public:
   }
 
 // data member also public
+  int level_ = -1; // from ReadOptions::level
+  int fd_ = -1;
+  unsigned avg_val_len_ = 0;
   mutable MainPatricia cspp_[1]; // be pointer-like, to minimize code changes
   union { ThreadLocalPtr iter_cache_; }; // for ApproximateOffsetOf
   size_t index_offset_; // also sum_value_len
@@ -129,6 +137,67 @@ size_t SingleFastTableReader::ApproximateMemoryUsage() const {
   return index_size_;
 }
 
+bool SingleFastTableReader::ReadValue(Slice* val, size_t len, size_t offset,
+                                      const ReadOptions& read_options,
+                                      Cleanable* pinner, Status* st) {
+  assert(!pinner->HasCleanups());
+  if (UNLIKELY(offset + len > index_offset_)) {
+    string_appender<> msg;
+    msg | "SST Get: read(" | file_->file_name()
+        | ", len " | len | ", offset " | offset | ")"
+        | " offset + len > index_offset_ " | index_offset_
+        | " should be data corruption";
+    *st = Status::Corruption(msg);
+    return false;
+  }
+  bool use_pread =
+      avg_val_len_ >= unsigned(factory_->table_options_.minPreadLen) &&
+      avg_val_len_ <= unsigned(factory_->table_options_.maxPreadLen) &&
+      level_ >= factory_->table_options_.minPreadLevel;
+  if (0 == len || (read_options.pinning_tls && !use_pread)) {
+    // use mmap with zero copy
+    if (UNLIKELY(len >= size_t(factory_->table_options_.maxPreadLen))) {
+      MmapWarmUpBytes(file_data_.data_ + offset, len);
+    }
+    val->data_ = file_data_.data_ + offset;
+    val->size_ = len;
+    return true;
+  }
+  auto buf = (char*)malloc(len);
+  if (UNLIKELY(!buf)) {
+    string_appender<> msg;
+    msg | "SST Get: read(" | file_->file_name()
+        | ", len " | len | ", offset " | offset | ") malloc fail";
+    *st = Status::MemoryLimit(msg, strerror(errno));
+    return false;
+  }
+  if (use_pread) {
+    auto [func_ptr, func_name] = read_options.async_io
+         ? std::make_pair(fiber_aio_read, "fiber_aio_read")
+         : std::make_pair(         pread,          "pread");
+    auto rlen = func_ptr(fd_, buf, len, offset);
+    if (size_t(rlen) != len) {
+      string_appender<> msg;
+      msg | func_name | "(" | file_->file_name()
+          | ", len " | len | ", offset " | offset | ") = " | rlen;
+      *st = Status::IOError(msg, strerror(errno));
+      free(buf);
+      return false;
+    }
+  } else { // use mmap with memcpy
+    if (UNLIKELY(len >= size_t(factory_->table_options_.maxPreadLen))) {
+      MmapWarmUpBytes(file_data_.data_ + offset, len);
+    }
+    memcpy(buf, file_data_.data_ + offset, len);
+  }
+  // trick: extra param arg2 passed to free will be ignored
+  auto clean = (Cleanable::CleanupFunction)(free);
+  pinner->RegisterCleanup(clean, buf, nullptr);
+  val->data_ = buf;
+  val->size_ = len;
+  return true;
+}
+
 Status SingleFastTableReader::Get(const ReadOptions& readOptions,
                                   const Slice& ikey,
                                   GetContext* get_context,
@@ -145,8 +214,10 @@ Status SingleFastTableReader::Get(const ReadOptions& readOptions,
   auto entry = cspp_->value_of<TopFastIndexEntry>(token);
   const SequenceNumber finding_seq = pikey.sequence;
   Slice val;
-  Cleanable noop_pinner;
-  Cleanable* pinner = readOptions.pinning_tls ? &noop_pinner : nullptr;
+  Cleanable pinner[1]; // empty pinner for zero copy, [1] for min code change
+  auto do_read = [&](size_t len, size_t offset) {
+    return ReadValue(&val, len, offset, readOptions, pinner, &st);
+  };
   if (entry.valueMul) {
     size_t valueNum = entry.valueLen;
     TERARK_ASSERT_GE(valueNum, 2);
@@ -155,8 +226,9 @@ Status SingleFastTableReader::Get(const ReadOptions& readOptions,
     UnPackSequenceAndType(entry.seqvt, &pikey.sequence, &pikey.type);
     if (pikey.sequence <= finding_seq) {
       if (!just_check_key_exists) {
-        val.data_ = file_data_.data_ + posArr[0];
-        val.size_ = posArr[1] - posArr[0];
+        if (!do_read(posArr[1] - posArr[0], posArr[0])) {
+          return st;
+        }
       }
       else {
         if (kTypeMerge == pikey.type) {
@@ -172,8 +244,9 @@ Status SingleFastTableReader::Get(const ReadOptions& readOptions,
       if (!just_check_key_exists) {
         size_t val_beg = posArr[lo+1];
         size_t val_end = posArr[lo+2];
-        val.data_ = file_data_.data_ + val_beg;
-        val.size_ = val_end - val_beg;
+        if (!do_read(val_end - val_beg, val_beg)) {
+          return st;
+        }
       }
       else {
         if (kTypeMerge == pikey.type) {
@@ -196,8 +269,9 @@ Status SingleFastTableReader::Get(const ReadOptions& readOptions,
     }
     if (pikey.sequence <= finding_seq) {
       if (!just_check_key_exists) {
-        val.data_ = file_data_.data_ + entry.valuePos;
-        val.size_ = entry.valueLen;
+        if (!do_read(entry.valueLen, entry.valuePos)) {
+          return st;
+        }
       }
       else {
         if (kTypeMerge == pikey.type) {
@@ -699,6 +773,9 @@ void SingleFastTableReader::Open(RandomAccessFileReader* file, Slice file_data,
   index_size_ = indexBlock.data.size_;
   index_offset_ = indexBlock.data.data_ - file_data_.data_;
   live_iter_num_ = 0;
+  level_ = tro.level;
+  avg_val_len_ = unsigned(index_offset_ / props->num_entries);
+
   TERARK_VERIFY_AL(index_offset_, 64);
   if (tro.ioptions.advise_random_on_open) {
     if (warmupLevel < WarmupLevel::kValue)
@@ -733,6 +810,7 @@ SingleFastTableFactory::NewTableReader(
             bool prefetch_index_and_filter_in_cache)
 const try {
   (void)prefetch_index_and_filter_in_cache; // now ignore
+  int fd = (int)file->target()->FileDescriptor();
   Slice file_data;
   file->exchange(new MmapReadWrapper(file));
   Status s = TopMmapReadAll(*file, file_size, &file_data);
@@ -745,6 +823,7 @@ const try {
   }
   auto t = new SingleFastTableReader();
   table->reset(t);
+  t->fd_ = fd;
   t->factory_ = this;
   t->Open(file.release(), file_data, tro, table_options_.warmupLevel);
   as_atomic(num_readers_).fetch_add(1, std::memory_order_relaxed);

@@ -179,6 +179,7 @@ Status SingleFastTableReader::Get(const ReadOptions& readOptions,
         if (kTypeMerge == pikey.type) {
           pikey.type = kTypeValue; // instruct SaveValue to stop earlier
         }
+        val = Slice();
       }
       auto seqvt = unaligned_load<uint64_t>(seqArr, lo);
       UnPackSequenceAndType(seqvt, &pikey.sequence, &pikey.type);

@@ -46,6 +46,7 @@ public:
   void DoWriteAppend(const void* data, size_t size);
   void WriteValue(uint64_t seqvt, const Slice&);
   void ToplingFlushBuffer();
+  bool NeedCompact() const override;
 
   const TopFastTableFactory* table_factory_;
   struct ValueNode {
@@ -66,8 +67,10 @@ public:
   uint32_t multi_num_ = 0;
   bool is_all_seqno_zero_ = true;
   bool is_wtoken_released_ = false;
+  bool props_collected_ = false;
   WriteMethod writeMethod_;
   long long t0 = 0;
+  int level_;
 };
 
 constexpr size_t IndexEntrySize = sizeof(TopFastIndexEntry);
@@ -80,6 +83,7 @@ SingleFastTableBuilder::SingleFastTableBuilder(
   : TopTableBuilderBase(tbo, file), table_factory_(table_factory)
   , cspp_(IndexEntrySize, 2u<<20u, Patricia::SingleThreadStrict)
 {
+  level_ = tbo.level_at_creation;
   debugLevel_ = (signed char)table_factory->table_options_.debugLevel;
   properties_.compression_name = "SngFast";
   writeMethod_ = table_factory->table_options_.writeMethod;
@@ -286,6 +290,13 @@ void SingleFastTableBuilder::WriteValue(uint64_t seqvt, const Slice& value) {
   prev_value_len_ = value.size();
 }
 
+bool SingleFastTableBuilder::NeedCompact() const {
+  if (!props_collected_)
+    return table_factory_->table_options_.needCompactOnOmitPropsCollector;
+  else
+    return TopTableBuilderBase::NeedCompact();
+}
+
 const uint64_t kSingleFastTableMagic = 0x747361466c676e53; // SnglFast
 
 Status SingleFastTableBuilder::Finish() try {
@@ -325,6 +336,8 @@ Status SingleFastTableBuilder::Finish() try {
 
 //------ NotifyCollectTableCollectorsOnAdd(...)
 // Same as SingleFastTableReader::ApproximateOffsetOf()
+if (level_ >= table_factory_->table_options_.collectPropertiesMinLevel) {
+  props_collected_ = true;
   auto iter = cspp_.new_iter();
   double approximateFileSize = offset_ + 500;
   double coefficient = approximateFileSize / (indexOffset + 1.0);
@@ -366,6 +379,7 @@ Status SingleFastTableBuilder::Finish() try {
     nth++;
   } while (isReverse ? iter->decr() : iter->incr());
   iter->dispose();
+}
 //-------------------------------------------------------------------------
 
   WriteMeta(kSingleFastTableMagic, {{kCSPPIndex, {indexOffset, index_size}}});

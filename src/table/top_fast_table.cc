@@ -78,6 +78,8 @@ struct TopFastTableOptions_Json : TopFastTableOptions {
     ROCKSDB_JSON_OPT_PROP(js, accurateKeyAnchorsSize);
     ROCKSDB_JSON_OPT_SIZE(js, keyAnchorSizeUnit);
     ROCKSDB_JSON_OPT_PROP(js, useFilePreallocation);
+    ROCKSDB_JSON_OPT_PROP(js, needCompactOnOmitPropsCollector);
+    ROCKSDB_JSON_OPT_PROP(js, collectPropertiesMinLevel);
     ROCKSDB_JSON_OPT_SIZE(js, minPreadLen);
     ROCKSDB_JSON_OPT_SIZE(js, maxPreadLen);
     ROCKSDB_JSON_OPT_PROP(js, minPreadLevel);
@@ -93,6 +95,8 @@ struct TopFastTableOptions_Json : TopFastTableOptions {
     ROCKSDB_JSON_SET_PROP(djs, accurateKeyAnchorsSize);
     ROCKSDB_JSON_SET_SIZE(djs, keyAnchorSizeUnit);
     ROCKSDB_JSON_SET_PROP(djs, useFilePreallocation);
+    ROCKSDB_JSON_SET_PROP(djs, needCompactOnOmitPropsCollector);
+    ROCKSDB_JSON_SET_PROP(djs, collectPropertiesMinLevel);
     ROCKSDB_JSON_SET_SIZE(djs, minPreadLen);
     ROCKSDB_JSON_SET_SIZE(djs, maxPreadLen);
     ROCKSDB_JSON_SET_PROP(djs, minPreadLevel);

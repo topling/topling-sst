@@ -1202,7 +1202,7 @@ bool VecAutoSortTableReader::GetRandomInternalKeysAppend(
     fstring ukey;
     if (fixed_key_len_) {
       if (fixed_value_len_ >= 0)
-        ukey = fstrvec_[r].prefix(fixed_key_len_).str();
+        ukey = fstrvec_[r];
       else
         ukey = fstrvec_[r].notail(sizeof(uint32_t)).str();
     } else {
@@ -1251,12 +1251,12 @@ Status VecAutoSortTableReader::ApproximateKeyAnchors
     size_t curr_key_offset, curr_val_offset; // end offset
     if (fixed_key_len) {
       if (fixed_value_len >= 0) {
-        suffix = fstrvec_[r].prefix(fixed_key_len).str();
-        curr_key_offset = (r+1) * fixed_key_len;
+        suffix = fstrvec_[r];
+        curr_key_offset = (r+1) * fixed_suffix_len;
         curr_val_offset = (r+1) * fixed_value_len;
       } else {
         suffix = fstrvec_[r].notail(sizeof(uint32_t)).str();
-        curr_key_offset = (r+1) * fixed_key_len;
+        curr_key_offset = (r+1) * fixlen;
         curr_val_offset = unaligned_load<uint32_t>(index_base + fixlen * (r + 2) - 4);
       }
     } else {
@@ -1277,6 +1277,8 @@ Status VecAutoSortTableReader::ApproximateKeyAnchors
     auto curr_kv = curr_key_offset + curr_val_offset;
     auto prev_kv = prev_key_offset + prev_val_offset;
     anchors.push_back({std::move(ukey), curr_kv - prev_kv});
+    prev_key_offset = curr_key_offset;
+    prev_val_offset = curr_val_offset;
   }
   return Status::OK();
 }

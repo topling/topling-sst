@@ -75,7 +75,7 @@ TopFastTableBuilder::TopFastTableBuilder(
   : TopTableBuilderBase(tbo, file), table_factory_(table_factory)
 {
   //size_t key_prefixLen = table_factory->table_options_.keyPrefixLen;
-  size_t key_prefixLen = 0; // TODO: bugfix for non-zero key_prefixLen
+  uint32_t key_prefixLen = 0; // TODO: bugfix for non-zero key_prefixLen
 
   currentPrefix_.n = -1; // not equal to any string
   properties_.compression_name = "TooFast";

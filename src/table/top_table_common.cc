@@ -124,7 +124,7 @@ size_t TableMultiPartInfo::calc_size(size_t prefixLen, size_t partCount) {
 
 void TableMultiPartInfo::Init(size_t prefixLen, size_t partCount) {
   offset_.ensure_capacity(partCount + 1);
-  prefixSet_.m_fixlen = prefixLen;
+  prefixSet_.m_fixlen = uint32_t(prefixLen);
   prefixSet_.m_strpool.ensure_capacity(prefixLen * partCount);
 }
 
@@ -153,7 +153,7 @@ bool TableMultiPartInfo::risk_set_memory(const void* p, size_t s) {
   TERARK_ASSERT_AL(size_t(p), 8);
   LittleEndianDataInput<terark::MemIO> dio(p, s);
   size_t partCount = dio.load_as<uint32_t>();
-  size_t fixlen = dio.load_as<uint32_t>();
+  uint32_t fixlen = dio.load_as<uint32_t>();
   offset_.risk_set_data((KeyValueOffset*)dio.current(), partCount + 1);
   dio.skip(offset_.used_mem_size());
   TERARK_ASSERT_AL(size_t(dio.current()), 8);

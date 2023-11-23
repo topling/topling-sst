@@ -15,8 +15,8 @@ namespace rocksdb {
 
 using terark::StrDateTimeNow;
 #define LOG_POS_ARGS rocksdb::StrDateTimeNow(), RocksLogShorterFileName(__FILE__), __LINE__
-#define STD_INFO(format, ...) fprintf(stderr, "%s INFO: %s:%d: " format "\n", LOG_POS_ARGS, ##__VA_ARGS__)
-#define STD_WARN(format, ...) fprintf(stderr, "%s WARN: %s:%d: " format "\n", LOG_POS_ARGS, ##__VA_ARGS__)
+#define STD_INFO(format, ...) fprintf(stderr, "%s INFO %s:%d: " format "\n", LOG_POS_ARGS, ##__VA_ARGS__)
+#define STD_WARN(format, ...) fprintf(stderr, "%s WARN %s:%d: " format "\n", LOG_POS_ARGS, ##__VA_ARGS__)
 
 #undef INFO
 #undef WARN
@@ -34,16 +34,6 @@ using terark::StrDateTimeNow;
 #endif
 
 #define VERIFY_STATUS_OK(s) TERARK_VERIFY_F(s.ok(), "%s", s.ToString().c_str())
-
-#ifdef _MSC_VER
-#define TOPLING_SST_ASSUME(cond) __assume(cond)
-#elif defined(__clang__)
-#define TOPLING_SST_ASSUME(cond) __builtin_assume(cond)
-#elif defined(__GNUC__)
-#define TOPLING_SST_ASSUME(cond) ((cond) ? static_cast<void>(0) : __builtin_unreachable())
-#else
-#define TOPLING_SST_ASSUME(cond) static_cast<void>(!!(cond))
-#endif
 
 using std::string;
 using std::unique_ptr;
@@ -71,7 +61,7 @@ const std::string kRangeDelBlock = "rocksdb.range_del";
 #endif
 
 inline uint64_t ReadBigEndianUint64(const void* beg, size_t len) {
-  TOPLING_SST_ASSUME(len <= 8);
+  ROCKSDB_ASSUME(len <= 8);
   union {
     byte_t bytes[8];
     uint64_t value;

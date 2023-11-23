@@ -9,6 +9,7 @@
 #include <inttypes.h>
 #include <rocksdb/preproc.h>
 #include <rocksdb/slice.h>
+#include <rocksdb/version.h>
 #include <logging/logging.h>
 
 namespace rocksdb {

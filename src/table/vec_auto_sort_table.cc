@@ -119,7 +119,7 @@ public:
   Status Finish() final;
   void Abandon() final;
   uint64_t EstimatedFileSize() const final {
-    return strvec_.size() + lenbuf_.size();
+    return strvec_.size() + lenbuf_.tell(); // tell() is real memory usage
   }
   void DoWriteAppend(const void* data, size_t size) {
     fobuf_.ensureWrite(data, size);
@@ -276,7 +276,7 @@ VecAutoSortTableBuilder::VecAutoSortTableBuilder(
   fstream_.attach(fd);
   fobuf_.attach(&fstream_);
   fobuf_.initbuf(table_factory->fileWriteBufferSize);
-  lenbuf_.resize(64*1024);
+  lenbuf_.reserve(64*1024);
   strvec_.reserve(256*1024);
 
   t0 = g_pf.now();

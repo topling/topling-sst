@@ -139,7 +139,7 @@ valvec<byte_t> TableMultiPartInfo::dump() {
   valvec<byte_t> ret;
   ret.risk_set_data(buf.begin());
   ret.risk_set_size(buf.tell());
-  ret.risk_set_capacity(buf.size());
+  ret.risk_set_capacity(buf.capacity());
   buf.risk_release_ownership();
   return ret;
 }

@@ -276,7 +276,7 @@ void SingleFastTableBuilder::WriteValue(uint64_t seqvt, const Slice& value) {
     // 2. if not valueMul, use TopFastIndexEntry::valueLen, it is also ok
     DoWriteAppend("\0", 1);
   }
-  else if (valueNodeVec_.size() == 2 && 0 == prev_value_len_) {
+  if (valueNodeVec_.size() == 2 && 0 == prev_value_len_) {
     valueNodeVec_[0].pos++; // adjust the pos to make posArr satisfy:
                             // valueLen[i] = posArr[i+1] - posArr[i]
   }

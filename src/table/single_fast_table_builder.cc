@@ -234,6 +234,7 @@ void SingleFastTableBuilder::FinishPrevUserKey() {
   }
   else {
     assert(valueNodeVec_.size() == 1);
+    TERARK_VERIFY_LE(prev_value_len_, INT32_MAX);
     uint64_t pos = valueNodeVec_[0].pos;
     entry.valuePos = uint32_t(pos);
     entry.valueLen = uint32_t(prev_value_len_);

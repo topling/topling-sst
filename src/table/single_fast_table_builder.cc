@@ -59,6 +59,7 @@ public:
   size_t max_val_len = 0, min_val_len = SIZE_MAX;
   MainPatricia cspp_;
   MainPatricia::SingleWriterToken wtoken_;
+  valvec<char> firstUserKey_;
   valvec<char> prevUserKey_;
   OsFileStream fstream_;
   OutputBuffer fobuf_;
@@ -170,6 +171,7 @@ void SingleFastTableBuilder::Add(const Slice& key, const Slice& value) try {
         num_user_key_++;
       }
     } else {
+      firstUserKey_.assign(userKey);
       prevUserKey_.assign(userKey);
       num_user_key_++;
     }
@@ -292,8 +294,15 @@ void SingleFastTableBuilder::WriteValue(uint64_t seqvt, const Slice& value) {
 }
 
 bool SingleFastTableBuilder::NeedCompact() const {
-  if (!props_collected_)
+  if (!props_collected_) {
+    if (size_t kplen = table_factory_->table_options_.keyPrefixLen) {
+      kplen = std::min({kplen, firstUserKey_.size(), prevUserKey_.size()});
+      if (memcmp(firstUserKey_.data(), prevUserKey_.data(), kplen) != 0)
+        // has multiple prefixes, likely worse for compact, so return false
+        return false;
+    }
     return table_factory_->table_options_.needCompactOnOmitPropsCollector;
+  }
   else
     return TopTableBuilderBase::NeedCompact();
 }

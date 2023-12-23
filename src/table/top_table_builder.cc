@@ -107,10 +107,13 @@ void TopTableBuilderBase::WriteMeta(uint64_t magic,
     PropertyBlockBuilder propBlockBuilder;
     propBlockBuilder.AddTableProperty(properties_);
     for (auto& collector : collectors_) {
-      UserCollectedProperties user_prop;
-      Status s = collector->Finish(&user_prop);
-      if (s.ok())
-        propBlockBuilder.Add(user_prop);
+      Status s = collector->Finish(&properties_.user_collected_properties);
+      if (s.ok()) {
+        for (const auto& prop : collector->GetReadableProperties()) {
+          properties_.readable_properties.insert(prop);
+        }
+        propBlockBuilder.Add(properties_.user_collected_properties);
+      }
       else
         LogPropertiesCollectionError(log, "Finish", collector->Name());
     }

@@ -735,6 +735,9 @@ public:
   Status ApproximateKeyAnchors(const ReadOptions&, std::vector<Anchor>&) override;
 #endif
   std::string ToWebViewString(const json& dump_options) const final;
+  bool IsMyFactory(const TableFactory* fac) const final {
+    return fac == factory_;
+  }
 
 // data member also public
   struct vkvv_t {

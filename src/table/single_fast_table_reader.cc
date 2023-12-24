@@ -61,6 +61,9 @@ public:
   std::string FirstInternalKey(Slice user_key, MainPatricia::SingleReaderToken&) const;
 
   std::string ToWebViewString(const json& dump_options) const final;
+  bool IsMyFactory(const TableFactory* fac) const final {
+    return fac == factory_;
+  }
 
   Patricia::Iterator* TLS_Iter() {
     auto iter = (Patricia::Iterator*)iter_cache_.Get();

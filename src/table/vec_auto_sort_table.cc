@@ -1379,14 +1379,20 @@ VecAutoSortTableFactory::NewTableReader(
             bool prefetch_index_and_filter_in_cache)
 const try {
   (void)prefetch_index_and_filter_in_cache; // now ignore
+  auto t0 = g_pf.now();
   Slice file_data;
   file->exchange(new MmapReadWrapper(file));
   Status s = TopMmapReadAll(*file, file_size, &file_data);
   if (!s.ok()) {
     return s;
   }
+  auto t1 = g_pf.now();
   MmapAdvSeq(file_data);
 //MmapWarmUp(file_data);
+  auto t2 = g_pf.now();
+  ROCKS_LOG_DEBUG(tro.ioptions.info_log,
+      "NewTableReader(%s): mmap %.3f ms, warmup(madv_seq) %.3f ms",
+      file->file_name().c_str(), g_pf.mf(t0,t1), g_pf.mf(t1,t2));
   auto t = new VecAutoSortTableReader(this);
   table->reset(t);
   t->Open(file.release(), file_data, tro);

@@ -813,6 +813,7 @@ SingleFastTableFactory::NewTableReader(
             bool prefetch_index_and_filter_in_cache)
 const try {
   (void)prefetch_index_and_filter_in_cache; // now ignore
+  auto t0 = g_pf.now();
   int fd = (int)file->target()->FileDescriptor();
   Slice file_data;
   file->exchange(new MmapReadWrapper(file));
@@ -820,10 +821,16 @@ const try {
   if (!s.ok()) {
     return s;
   }
+  auto t1 = g_pf.now();
   if (WarmupLevel::kValue == table_options_.warmupLevel) {
     MmapAdvSeq(file_data);
     MmapWarmUp(file_data);
   }
+  auto t2 = g_pf.now();
+  ROCKS_LOG_DEBUG(tro.ioptions.info_log,
+      "NewTableReader(%s): mmap %.3f ms, warmup(%s) %.3f ms",
+      file->file_name().c_str(), g_pf.mf(t0,t1),
+      enum_cstr(table_options_.warmupLevel), g_pf.mf(t1,t2));
   auto t = new SingleFastTableReader();
   table->reset(t);
   t->fd_ = fd;

@@ -169,6 +169,7 @@ bool SingleFastTableReader::ReadValue(Slice* val, size_t len, size_t offset,
   auto buf = (char*)malloc(len);
   if (UNLIKELY(!buf)) {
     string_appender<> msg;
+    msg | __FILE__ | ":" | __LINE__ | ": ReadValue in ";
     msg | "SST Get: read(" | file_->file_name()
         | ", len " | len | ", offset " | offset | ") malloc fail";
     *st = Status::MemoryLimit(msg, strerror(errno));

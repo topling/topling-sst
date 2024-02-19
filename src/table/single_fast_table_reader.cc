@@ -425,27 +425,23 @@ public:
     }
   }
   Slice key() const final {
-    TERARK_ASSERT_GE(val_idx_, 0);
-    TERARK_ASSERT_LT(val_idx_, val_num_);
+    TERARK_ASSERT_BT(val_idx_, 0, val_num_);
     fstring word = iter_->word();
     TERARK_ASSERT_GE(iter_->mutable_word().capacity(), word.size() + 8);
     return Slice(word.data(), word.size() + 8); // NOLINT
   }
   Slice user_key() const final {
-    TERARK_ASSERT_GE(val_idx_, 0);
-    TERARK_ASSERT_LT(val_idx_, val_num_);
+    TERARK_ASSERT_BT(val_idx_, 0, val_num_);
     fstring word = iter_->word();
     TERARK_ASSERT_GE(iter_->mutable_word().capacity(), word.size() + 8);
     return Slice(word.data(), word.size()); // NOLINT
   }
   Slice value() const final {
-    TERARK_ASSERT_GE(val_idx_, 0);
-    TERARK_ASSERT_LT(val_idx_, val_num_);
+    TERARK_ASSERT_BT(val_idx_, 0, val_num_);
     return Slice(tab_->file_data_.data_ + val_pos_, val_len_); // NOLINT
   }
   bool PrepareAndGetValue(Slice* v) final {
-    TERARK_ASSERT_GE(val_idx_, 0);
-    TERARK_ASSERT_LT(val_idx_, val_num_);
+    TERARK_ASSERT_BT(val_idx_, 0, val_num_);
     v->data_ = tab_->file_data_.data_ + val_pos_;
     v->size_ = val_len_;
     return true;
@@ -493,8 +489,7 @@ public:
     NextAndCheckValid(); // ignore return value
   }
   bool NextAndCheckValid() final {
-    TERARK_ASSERT_GE(val_idx_, 0);
-    TERARK_ASSERT_LE(val_idx_, val_num_);
+    TERARK_ASSERT_BT(val_idx_, 0, val_num_);
     if (++val_idx_ < val_num_) {
       assert(val_num_ >= 2);
       auto seqvt = unaligned_load<uint64_t>(seq_arr_, val_idx_-1);
@@ -514,8 +509,7 @@ public:
     PrevAndCheckValid(); // ignore return value
   }
   bool PrevAndCheckValid() final {
-    TERARK_ASSERT_GE(val_idx_, 0);
-    TERARK_ASSERT_LE(val_idx_, val_num_);
+    TERARK_ASSERT_BT(val_idx_, 0, val_num_);
     if (--val_idx_ >= 0) {
       uint64_t seqvt = val_idx_ > 0
                      ? unaligned_load<uint64_t>(seq_arr_, val_idx_-1)
@@ -569,8 +563,7 @@ public:
     NextAndCheckValid(); // ignore return value
   }
   bool NextAndCheckValid() final {
-    TERARK_ASSERT_GE(val_idx_, 0);
-    TERARK_ASSERT_LT(val_idx_, val_num_);
+    TERARK_ASSERT_BT(val_idx_, 0, val_num_);
     if (++val_idx_ < val_num_) {
       assert(val_num_ >= 2);
       auto seqvt = unaligned_load<uint64_t>(seq_arr_, val_idx_-1);
@@ -590,8 +583,7 @@ public:
     PrevAndCheckValid(); // ignore return value
   }
   bool PrevAndCheckValid() final {
-    TERARK_ASSERT_GE(val_idx_, 0);
-    TERARK_ASSERT_LT(val_idx_, val_num_);
+    TERARK_ASSERT_BT(val_idx_, 0, val_num_);
     if (--val_idx_ >= 0) {
       uint64_t seqvt = val_idx_ > 0
                      ? unaligned_load<uint64_t>(seq_arr_, val_idx_-1)

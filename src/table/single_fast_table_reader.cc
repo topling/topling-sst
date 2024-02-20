@@ -298,6 +298,7 @@ size_t DumpInternalIterator(InternalIterator* iter, size_t num, bool hex);
 class SingleFastTableReader::BaseIter : public InternalIterator, boost::noncopyable {
 public:
   const SingleFastTableReader* tab_;
+  const char* file_mem_;
   MainPatricia* cspp_;
   Patricia::Iterator* iter_;
   uint64_t global_seqno_;
@@ -309,6 +310,7 @@ public:
   const uint32_t* pos_arr_;
 
   explicit BaseIter(const SingleFastTableReader* table) { // NOLINT
+    file_mem_ = table->file_data_.data();
     tab_ = table;
     cspp_ = table->cspp_;
     iter_ = table->cspp_->new_iter();
@@ -438,11 +440,11 @@ public:
   }
   Slice value() const final {
     TERARK_ASSERT_BT(val_idx_, 0, val_num_);
-    return Slice(tab_->file_data_.data_ + val_pos_, val_len_); // NOLINT
+    return Slice(file_mem_ + val_pos_, val_len_); // NOLINT
   }
   bool PrepareAndGetValue(Slice* v) final {
     TERARK_ASSERT_BT(val_idx_, 0, val_num_);
-    v->data_ = tab_->file_data_.data_ + val_pos_;
+    v->data_ = file_mem_ + val_pos_;
     v->size_ = val_len_;
     return true;
   }

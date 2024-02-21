@@ -183,9 +183,11 @@ void TopTableReaderBase::LoadCommonPart(RandomAccessFileReader* file,
 
 // verify comparator
   TERARK_VERIFY_F(IsBytewiseComparator(ioptions.user_comparator),
-                  "Name(): %s", ioptions.user_comparator->Name());
+                  "%s : Name(): %s", file->file_name().c_str(),
+                  ioptions.user_comparator->Name());
   TERARK_VERIFY_F(IsBytewiseComparator(props->comparator_name),
-                  "Name(): %s", props->comparator_name.c_str());
+                  "%s : Name(): %s", file->file_name().c_str(),
+                  props->comparator_name.c_str());
   if (IsForwardBytewiseComparator(props->comparator_name) !=
       IsForwardBytewiseComparator(ioptions.user_comparator))
   {

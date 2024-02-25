@@ -301,6 +301,12 @@ public:
   const char* file_mem_;
   MainPatricia* cspp_;
   Patricia::Iterator* iter_;
+  typedef bool (*DfaIterScanFN)(ADFA_LexIterator*);
+ #if defined(_MSC_VER) || defined(__clang__)
+ #else
+  DfaIterScanFN dfa_iter_next_;
+  DfaIterScanFN dfa_iter_prev_;
+ #endif
   uint64_t global_seqno_;
   int val_idx_;
   int val_num_;
@@ -314,9 +320,21 @@ public:
     tab_ = table;
     cspp_ = table->cspp_;
     iter_ = table->cspp_->new_iter();
+   #if defined(_MSC_VER) || defined(__clang__)
+   #else
+    dfa_iter_next_ = (DfaIterScanFN)(iter_->*(&ADFA_LexIterator::incr));
+    dfa_iter_prev_ = (DfaIterScanFN)(iter_->*(&ADFA_LexIterator::decr));
+   #endif
     global_seqno_ = table->global_seqno_;
     SetInvalid();
   }
+ #if defined(_MSC_VER) || defined(__clang__)
+  bool InvokeDfaIterNext() { return iter_->incr(); }
+  bool InvokeDfaIterPrev() { return iter_->decr(); }
+ #else
+  bool InvokeDfaIterNext() { return dfa_iter_next_(iter_); }
+  bool InvokeDfaIterPrev() { return dfa_iter_prev_(iter_); }
+ #endif
   ~BaseIter() override {
     iter_->dispose();
     as_atomic(tab_->live_iter_num_).fetch_sub(1, std::memory_order_relaxed);
@@ -500,7 +518,7 @@ public:
       val_len_ = pos_arr_[val_idx_ + 1] - val_pos_;
       return true;
     }
-    if (UNLIKELY(!iter_->incr())) {
+    if (UNLIKELY(!InvokeDfaIterNext())) {
       SetInvalid();
       return false;
     }
@@ -523,7 +541,7 @@ public:
       val_len_ = pos_arr_[val_idx_ + 1] - val_pos_;
       return true;
     }
-    if (UNLIKELY(!iter_->decr())) {
+    if (UNLIKELY(!InvokeDfaIterPrev())) {
       SetInvalid();
       return false;
     }
@@ -546,7 +564,7 @@ public:
     ROCKSDB_ASSERT_GE(target.size(), kNumInternalBytes);
     ParsedInternalKey pikey(target);
     if (iter_->seek_lower_bound(pikey.user_key)) {
-      if (iter_->word() != pikey.user_key && !iter_->decr()) {
+      if (iter_->word() != pikey.user_key && !InvokeDfaIterPrev()) {
         // reach ReverseBytewise end of trie
         SetInvalid();
         return;
@@ -574,7 +592,7 @@ public:
       val_len_ = pos_arr_[val_idx_ + 1] - val_pos_;
       return true;
     }
-    if (UNLIKELY(!iter_->decr())) {
+    if (UNLIKELY(!InvokeDfaIterPrev())) {
       SetInvalid();
       return false;
     }
@@ -597,7 +615,7 @@ public:
       val_len_ = pos_arr_[val_idx_ + 1] - val_pos_;
       return true;
     }
-    if (UNLIKELY(!iter_->incr())) {
+    if (UNLIKELY(!InvokeDfaIterNext())) {
       SetInvalid();
       return false;
     }

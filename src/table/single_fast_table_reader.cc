@@ -304,6 +304,7 @@ public:
   typedef bool (*DfaIterScanFN)(ADFA_LexIterator*);
  #if defined(_MSC_VER) || defined(__clang__)
  #else
+  #pragma GCC diagnostic ignored "-Wpmf-conversions"
   DfaIterScanFN dfa_iter_next_;
   DfaIterScanFN dfa_iter_prev_;
  #endif

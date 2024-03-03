@@ -299,7 +299,6 @@ class SingleFastTableReader::BaseIter : public InternalIterator, boost::noncopya
 public:
   const SingleFastTableReader* tab_;
   const char* file_mem_;
-  MainPatricia* cspp_;
   Patricia::Iterator* iter_;
   typedef bool (*DfaIterScanFN)(ADFA_LexIterator*);
  #if defined(_MSC_VER) || defined(__clang__)
@@ -319,7 +318,6 @@ public:
   explicit BaseIter(const SingleFastTableReader* table) { // NOLINT
     file_mem_ = table->file_data_.data();
     tab_ = table;
-    cspp_ = table->cspp_;
     iter_ = table->cspp_->new_iter();
    #if defined(_MSC_VER) || defined(__clang__)
    #else
@@ -360,11 +358,11 @@ public:
       SeekForPrevAux(target, InternalKeyComparator(BytewiseComparator()));
   }
   void SetAtFirstValue() {
-    auto entry = cspp_->value_of<TopFastIndexEntry>(*iter_);
+    auto entry = tab_->cspp_->value_of<TopFastIndexEntry>(*iter_);
     if (entry.valueMul) {
       val_num_ = entry.valueLen;
       assert(val_num_ >= 2);
-      pos_arr_ = (const uint32_t*)cspp_->mem_get(entry.valuePos);
+      pos_arr_ = (const uint32_t*)tab_->cspp_->mem_get(entry.valuePos);
       seq_arr_ = (const uint64_t*)(pos_arr_ + val_num_ + 1);
       val_pos_ = pos_arr_[0];
       val_len_ = pos_arr_[1] - pos_arr_[0];
@@ -381,11 +379,11 @@ public:
     unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
   }
   void SetAtLastValue() {
-    auto entry = cspp_->value_of<TopFastIndexEntry>(*iter_);
+    auto entry = tab_->cspp_->value_of<TopFastIndexEntry>(*iter_);
     if (entry.valueMul) {
       val_num_ = entry.valueLen;
       assert(val_num_ >= 2);
-      pos_arr_ = (const uint32_t*)cspp_->mem_get(entry.valuePos);
+      pos_arr_ = (const uint32_t*)tab_->cspp_->mem_get(entry.valuePos);
       seq_arr_ = (const uint64_t*)(pos_arr_ + val_num_ + 1);
       val_idx_ = val_num_ - 1;
       val_pos_ = pos_arr_[val_idx_];
@@ -404,12 +402,12 @@ public:
     unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
   }
   void SeekSeq(uint64_t seq) {
-    auto entry = cspp_->value_of<TopFastIndexEntry>(*iter_);
+    auto entry = tab_->cspp_->value_of<TopFastIndexEntry>(*iter_);
     if (entry.valueMul) {
       size_t vnum = entry.valueLen;
       val_num_ = entry.valueLen;
       assert(val_num_ >= 2);
-      pos_arr_ = (const uint32_t*)cspp_->mem_get(entry.valuePos);
+      pos_arr_ = (const uint32_t*)tab_->cspp_->mem_get(entry.valuePos);
       seq_arr_ = (const uint64_t*)(pos_arr_ + vnum + 1);
       if ((entry.seqvt >> 8) <= seq) {
         unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
@@ -534,7 +532,7 @@ public:
     if (--val_idx_ >= 0) {
       uint64_t seqvt = val_idx_ > 0
                      ? unaligned_load<uint64_t>(seq_arr_, val_idx_-1)
-                     : cspp_->value_of<TopFastIndexEntry>(*iter_).seqvt;
+                     : tab_->cspp_->value_of<TopFastIndexEntry>(*iter_).seqvt;
       if (seqvt >> 8 == 0)
         seqvt = PackSequenceAndType(global_seqno_, ValueType(seqvt));
       unaligned_save(iter_->mutable_word().end(), seqvt);
@@ -608,7 +606,7 @@ public:
     if (--val_idx_ >= 0) {
       uint64_t seqvt = val_idx_ > 0
                      ? unaligned_load<uint64_t>(seq_arr_, val_idx_-1)
-                     : cspp_->value_of<TopFastIndexEntry>(*iter_).seqvt;
+                     : tab_->cspp_->value_of<TopFastIndexEntry>(*iter_).seqvt;
       if (seqvt >> 8 == 0)
         seqvt = PackSequenceAndType(global_seqno_, ValueType(seqvt));
       unaligned_save(iter_->mutable_word().end(), seqvt);

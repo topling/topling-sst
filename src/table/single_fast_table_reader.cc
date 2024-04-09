@@ -68,15 +68,15 @@ public:
   Patricia::Iterator* TLS_Iter() {
     auto iter = (Patricia::Iterator*)iter_cache_.Get();
     if (UNLIKELY(!iter)) {
-      iter = cspp_->new_iter();
+      iter = cspp_.new_iter();
       iter_cache_.Reset(iter);
     }
     return iter;
   }
   size_t FirstValuePos(const Patricia::TokenBase& token) const {
-    auto entry = cspp_->value_of<TopFastIndexEntry>(token);
+    auto entry = cspp_.value_of<TopFastIndexEntry>(token);
     return entry.valueMul
-           ? aligned_load<uint32_t>(cspp_->mem_get(entry.valuePos))
+           ? aligned_load<uint32_t>(cspp_.mem_get(entry.valuePos))
            : entry.valuePos;
   }
   double SizeCoefficient() const {
@@ -88,7 +88,7 @@ public:
   int level_ = -1; // from ReadOptions::level
   int fd_ = -1;
   unsigned avg_val_len_ = 0;
-  mutable MainPatricia cspp_[1]; // be pointer-like, to minimize code changes
+  mutable MainPatricia cspp_;
   union { ThreadLocalPtr iter_cache_; }; // for ApproximateOffsetOf
   size_t index_offset_; // also sum_value_len
   size_t index_size_;
@@ -210,12 +210,12 @@ Status SingleFastTableReader::Get(const ReadOptions& readOptions,
   ROCKSDB_ASSERT_GE(ikey.size(), kNumInternalBytes);
   ParsedInternalKey pikey(ikey);
   Status st;
-  MainPatricia::SingleReaderToken token(cspp_);
-  if (!cspp_->lookup(pikey.user_key, &token)) {
+  MainPatricia::SingleReaderToken token(&cspp_);
+  if (!cspp_.lookup(pikey.user_key, &token)) {
     return st;
   }
   bool const just_check_key_exists = readOptions.just_check_key_exists;
-  auto entry = cspp_->value_of<TopFastIndexEntry>(token);
+  auto entry = cspp_.value_of<TopFastIndexEntry>(token);
   const SequenceNumber finding_seq = pikey.sequence;
   Slice val;
   Cleanable pinner[1]; // empty pinner for zero copy, [1] for min code change
@@ -225,7 +225,7 @@ Status SingleFastTableReader::Get(const ReadOptions& readOptions,
   if (entry.valueMul) {
     size_t valueNum = entry.valueLen;
     TERARK_ASSERT_GE(valueNum, 2);
-    auto posArr = (const uint32_t*)cspp_->mem_get(entry.valuePos);
+    auto posArr = (const uint32_t*)cspp_.mem_get(entry.valuePos);
     auto seqArr = (const uint64_t*)(posArr + valueNum + 1);
     UnPackSequenceAndType(entry.seqvt, &pikey.sequence, &pikey.type);
     if (pikey.sequence <= finding_seq) {
@@ -318,7 +318,7 @@ public:
   explicit BaseIter(const SingleFastTableReader* table) { // NOLINT
     file_mem_ = table->file_data_.data();
     tab_ = table;
-    iter_ = table->cspp_->new_iter();
+    iter_ = table->cspp_.new_iter();
    #if defined(_MSC_VER) || defined(__clang__)
    #else
     dfa_iter_next_ = (DfaIterScanFN)(iter_->*(&ADFA_LexIterator::incr));
@@ -358,11 +358,11 @@ public:
       SeekForPrevAux(target, InternalKeyComparator(BytewiseComparator()));
   }
   void SetAtFirstValue() {
-    auto entry = tab_->cspp_->value_of<TopFastIndexEntry>(*iter_);
+    auto entry = tab_->cspp_.value_of<TopFastIndexEntry>(*iter_);
     if (entry.valueMul) {
       val_num_ = entry.valueLen;
       assert(val_num_ >= 2);
-      pos_arr_ = (const uint32_t*)tab_->cspp_->mem_get(entry.valuePos);
+      pos_arr_ = (const uint32_t*)tab_->cspp_.mem_get(entry.valuePos);
       seq_arr_ = (const uint64_t*)(pos_arr_ + val_num_ + 1);
       val_pos_ = pos_arr_[0];
       val_len_ = pos_arr_[1] - pos_arr_[0];
@@ -379,11 +379,11 @@ public:
     unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
   }
   void SetAtLastValue() {
-    auto entry = tab_->cspp_->value_of<TopFastIndexEntry>(*iter_);
+    auto entry = tab_->cspp_.value_of<TopFastIndexEntry>(*iter_);
     if (entry.valueMul) {
       val_num_ = entry.valueLen;
       assert(val_num_ >= 2);
-      pos_arr_ = (const uint32_t*)tab_->cspp_->mem_get(entry.valuePos);
+      pos_arr_ = (const uint32_t*)tab_->cspp_.mem_get(entry.valuePos);
       seq_arr_ = (const uint64_t*)(pos_arr_ + val_num_ + 1);
       val_idx_ = val_num_ - 1;
       val_pos_ = pos_arr_[val_idx_];
@@ -402,12 +402,12 @@ public:
     unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
   }
   void SeekSeq(uint64_t seq) {
-    auto entry = tab_->cspp_->value_of<TopFastIndexEntry>(*iter_);
+    auto entry = tab_->cspp_.value_of<TopFastIndexEntry>(*iter_);
     if (entry.valueMul) {
       size_t vnum = entry.valueLen;
       val_num_ = entry.valueLen;
       assert(val_num_ >= 2);
-      pos_arr_ = (const uint32_t*)tab_->cspp_->mem_get(entry.valuePos);
+      pos_arr_ = (const uint32_t*)tab_->cspp_.mem_get(entry.valuePos);
       seq_arr_ = (const uint64_t*)(pos_arr_ + vnum + 1);
       if ((entry.seqvt >> 8) <= seq) {
         unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
@@ -532,7 +532,7 @@ public:
     if (--val_idx_ >= 0) {
       uint64_t seqvt = val_idx_ > 0
                      ? unaligned_load<uint64_t>(seq_arr_, val_idx_-1)
-                     : tab_->cspp_->value_of<TopFastIndexEntry>(*iter_).seqvt;
+                     : tab_->cspp_.value_of<TopFastIndexEntry>(*iter_).seqvt;
       if (seqvt >> 8 == 0)
         seqvt = PackSequenceAndType(global_seqno_, ValueType(seqvt));
       unaligned_save(iter_->mutable_word().end(), seqvt);
@@ -606,7 +606,7 @@ public:
     if (--val_idx_ >= 0) {
       uint64_t seqvt = val_idx_ > 0
                      ? unaligned_load<uint64_t>(seq_arr_, val_idx_-1)
-                     : tab_->cspp_->value_of<TopFastIndexEntry>(*iter_).seqvt;
+                     : tab_->cspp_.value_of<TopFastIndexEntry>(*iter_).seqvt;
       if (seqvt >> 8 == 0)
         seqvt = PackSequenceAndType(global_seqno_, ValueType(seqvt));
       unaligned_save(iter_->mutable_word().end(), seqvt);
@@ -642,8 +642,8 @@ SingleFastTableReader::NewIterator(const ReadOptions& ro,
 bool SingleFastTableReader::GetRandomInternalKeysAppend(
                   size_t num, std::vector<std::string>* output) const {
   SortableStrVec keys;
-  cspp_->dfa_get_random_keys(&keys, num);
-  MainPatricia::SingleReaderToken token(cspp_);
+  cspp_.dfa_get_random_keys(&keys, num);
+  MainPatricia::SingleReaderToken token(&cspp_);
   for (size_t i = 0; i < keys.size(); ++i) {
     fstring onekey = keys[i];
     output->push_back(FirstInternalKey(SliceOf(onekey), token));
@@ -664,7 +664,7 @@ ApproximateKeyAnchors(const ReadOptions& ro, std::vector<Anchor>& anchors) {
     an_num = std::max<size_t>(an_num, 256);
   }
   SortableStrVec keys;
-  cspp_->dfa_get_random_keys(&keys, std::min(cspp_->num_words(), an_num));
+  cspp_.dfa_get_random_keys(&keys, std::min(cspp_.num_words(), an_num));
   keys.sort();
   if (isReverseBytewiseOrder_) {
     std::reverse(keys.m_index.begin(), keys.m_index.end());
@@ -678,7 +678,7 @@ ApproximateKeyAnchors(const ReadOptions& ro, std::vector<Anchor>& anchors) {
       i++; // skip dup key
     }
     Slice user_key = SliceOf(keys[i]);
-    TERARK_VERIFY(cspp_->lookup(user_key, iter));
+    TERARK_VERIFY(cspp_.lookup(user_key, iter));
     size_t val_pos = FirstValuePos(*iter);
     size_t curr_offset = val_pos * coefficient;
     ROCKSDB_VERIFY_GE(curr_offset, prev_offset);
@@ -707,8 +707,8 @@ ApproximateKeyAnchors(const ReadOptions& ro, std::vector<Anchor>& anchors) {
 
 std::string SingleFastTableReader::FirstInternalKey(
         Slice user_key, MainPatricia::SingleReaderToken& token) const {
-  TERARK_VERIFY(cspp_->lookup(user_key, &token));
-  auto entry = cspp_->value_of<TopFastIndexEntry>(token);
+  TERARK_VERIFY(cspp_.lookup(user_key, &token));
+  auto entry = cspp_.value_of<TopFastIndexEntry>(token);
   std::string ikey;
   ikey.reserve(user_key.size_ + 8);
   ikey.append(user_key.data_, user_key.size_);
@@ -741,12 +741,12 @@ std::string SingleFastTableReader::ToWebViewString(const json& dump_options) con
     }},
   };
   djs["cspp"] = {
-    {"keys", cspp_->num_words()},
+    {"keys", cspp_.num_words()},
     {"offset", index_offset_},
-    {"size", SizeToString(cspp_->mem_size_inline())},
-    {"avg_key", cspp_->mem_size_inline()*1.0/cspp_->num_words() - sizeof(TopFastIndexEntry)},
+    {"size", SizeToString(cspp_.mem_size_inline())},
+    {"avg_key", cspp_.mem_size_inline()*1.0/cspp_.num_words() - sizeof(TopFastIndexEntry)},
     {"IndexEntrySize", sizeof(TopFastIndexEntry)},
-    {"zpath_states", cspp_->num_zpath_states()},
+    {"zpath_states", cspp_.num_zpath_states()},
   };
   return JsonToString(djs, dump_options);
 }
@@ -799,14 +799,14 @@ void SingleFastTableReader::Open(RandomAccessFileReader* file, Slice file_data,
   if (WarmupLevel::kIndex == warmupLevel) {
     MmapWarmUp(indexBlock.data);
   }
-  cspp_->self_mmap_user_mem(indexBlock.data);
+  cspp_.self_mmap_user_mem(indexBlock.data);
   if (!props->compression_options.empty()) {
     props->compression_options += ";";
   }
   props->compression_options += "Free = ";
-  props->compression_options += SizeToString(cspp_->mem_frag_size());
+  props->compression_options += SizeToString(cspp_.mem_frag_size());
   char buf[32];
-  auto len = sprintf(buf, ", %.2f%%", 100.0*cspp_->mem_frag_size()/file_size);
+  auto len = sprintf(buf, ", %.2f%%", 100.0*cspp_.mem_frag_size()/file_size);
   props->compression_options.append(buf, len);
 }
 

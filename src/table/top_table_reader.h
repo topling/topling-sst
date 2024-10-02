@@ -37,7 +37,7 @@ public:
 inline Status TopMmapReadAll
 (RandomAccessFileReader& file, uint64_t file_size, Slice* file_data) {
   IOOptions ioopt;
-#if ROCKSDB_MAJOR < 7
+#if ROCKSDB_MAJOR < 7 || (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 80100
   return file.Read(ioopt, 0, file_size, file_data, nullptr, nullptr);
 #else
   return file.Read(ioopt, 0, file_size, file_data, nullptr, nullptr, Env::IO_TOTAL);

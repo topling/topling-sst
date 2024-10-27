@@ -944,7 +944,12 @@ public:
   int num_;
   int idx_;
   uint32_t ikey_len_;
+#if defined(_MSC_VER)
+  char* get_internal_buf() { return (char*)(this + 1); }
+  #define ikey_internal_buf_ get_internal_buf()
+#else
   char  ikey_internal_buf_[0];
+#endif
   explicit BaseIter(const VecAutoSortTableReader* table, bool is_arena) {
     tab_ = table;
     file_data_ = table->file_data_.data_;

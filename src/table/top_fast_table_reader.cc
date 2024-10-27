@@ -11,6 +11,10 @@
 #include <table/table_reader.h>
 #include <table/meta_blocks.h>
 #include <util/thread_local.h>
+
+#if defined(_MSC_VER)
+  #pragma warning(disable: 4245) // convert int to size_t in fsa of cspp
+#endif
 #include <terark/fsa/cspptrie.inl>
 
 #include <topling/side_plugin_factory.h>
@@ -93,7 +97,7 @@ uint64_t TopFastTableReader::ApproximateOffsetOf(
       }
       ROCKSDB_ASSERT_EQ(iter->get_dfa(), trie); // now cspp_.size() must be 1
       if (iter->seek_lower_bound(user_key.substr(pref_len))) {
-        auto entry = iter->value_of<TopFastIndexEntry>();
+        auto entry = trie->value_of<TopFastIndexEntry>(*iter);
         if (entry.valueMul)
           val_pos = aligned_load<uint32_t>(trie->mem_get(entry.valuePos));
         else
@@ -168,7 +172,7 @@ Status TopFastTableReader::Get(const ReadOptions& readOptions,
     return st;
   }
   bool const just_check_key_exists = readOptions.just_check_key_exists;
-  auto entry = token.value_of<TopFastIndexEntry>();
+  auto entry = trie->value_of<TopFastIndexEntry>(token);
   const SequenceNumber finding_seq = pikey.sequence;
   Slice val;
   Cleanable noop_pinner;
@@ -303,7 +307,7 @@ public:
       SeekForPrevAux(target, InternalKeyComparator(BytewiseComparator()));
   }
   void SetAtFirstValue(const MainPatricia* trie) {
-    auto entry = iter_->value_of<TopFastIndexEntry>();
+    auto entry = (*cspp_)->value_of<TopFastIndexEntry>(*iter_);
     unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
     if (entry.valueMul) {
       val_num_ = entry.valueLen;
@@ -322,7 +326,7 @@ public:
     val_idx_ = 0;
   }
   void SetAtLastValue(const MainPatricia* trie) {
-    auto entry = iter_->value_of<TopFastIndexEntry>();
+    auto entry = (*cspp_)->value_of<TopFastIndexEntry>(*iter_);
     if (entry.valueMul) {
       val_num_ = entry.valueLen;
       assert(val_num_ >= 2);
@@ -343,7 +347,7 @@ public:
     unaligned_save(iter_->mutable_word().ensure_unused(8), entry.seqvt);
   }
   void SeekSeq(const MainPatricia* trie, uint64_t seq) {
-    auto entry = iter_->value_of<TopFastIndexEntry>();
+    auto entry = (*cspp_)->value_of<TopFastIndexEntry>(*iter_);
     if (entry.valueMul) {
       size_t vnum = entry.valueLen;
       val_num_ = entry.valueLen;
@@ -497,7 +501,7 @@ public:
     if (--val_idx_ >= 0) {
       uint64_t seqvt = val_idx_ > 0
                      ? unaligned_load<uint64_t>(seq_arr_, val_idx_-1)
-                     : iter_->value_of<TopFastIndexEntry>().seqvt;
+                     : (*cspp_)->value_of<TopFastIndexEntry>(*iter_).seqvt;
       unaligned_save(iter_->mutable_word().end(), seqvt);
       val_pos_ = pos_arr_[val_idx_];
       val_len_ = pos_arr_[val_idx_ + 1] - val_pos_;
@@ -602,7 +606,7 @@ public:
     if (--val_idx_ >= 0) {
       uint64_t seqvt = val_idx_ > 0
                      ? unaligned_load<uint64_t>(seq_arr_, val_idx_-1)
-                     : iter_->value_of<TopFastIndexEntry>().seqvt;
+                     : (*cspp_)->value_of<TopFastIndexEntry>(*iter_).seqvt;
       unaligned_save(iter_->mutable_word().end(), seqvt);
       val_pos_ = pos_arr_[val_idx_];
       val_len_ = pos_arr_[val_idx_ + 1] - val_pos_;
@@ -665,13 +669,17 @@ bool TopFastTableReader::GetRandomInternalKeysAppend(
 std::string TopFastTableReader::FirstInternalKey(
         Slice user_key, MainPatricia::SingleReaderToken& token) const {
   TERARK_VERIFY(token.trie()->lookup(user_key, &token));
-  auto entry = token.value_of<TopFastIndexEntry>();
+  auto trie = static_cast<const terark::MainPatricia*>(token.trie());
+  auto entry = trie->value_of<TopFastIndexEntry>(token);
   std::string ikey;
   ikey.reserve(user_key.size_ + 8);
   ikey.append(user_key.data_, user_key.size_);
   ikey.append((char*)&entry.seqvt, 8);
   return ikey;
 }
+
+// defined in top_fast_table_builder.cc
+extern const std::string kTopFastTableOffsetBlock;
 
 std::string TopFastTableReader::ToWebViewString(const json& dump_options) const {
   json djs;
@@ -724,8 +732,6 @@ void TopFastTableReader::Open(RandomAccessFileReader* file, Slice file_data,
     t->Open(file, file_data, tro);
     throw t.release(); // NOLINT
   }
-  // defined in top_fast_table_builder.cc
-  extern const std::string kTopFastTableOffsetBlock;
   BlockContents offsetBlock = ReadMetaBlockE(file, file_size,
         kTopFastTableMagic, tro.ioptions, kTopFastTableOffsetBlock);
   if (!offset_info_.risk_set_memory(offsetBlock.data)) {

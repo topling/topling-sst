@@ -18,6 +18,9 @@
 #include <rocksdb/merge_operator.h>
 
 // terark headers
+#if defined(_MSC_VER)
+  #pragma warning(disable: 4245) // convert int to size_t in fsa of cspp
+#endif
 #include <terark/fsa/cspptrie.inl>
 #include <terark/io/FileStream.hpp>
 #include <terark/io/MemMapStream.hpp>
@@ -368,7 +371,7 @@ if (level_ >= table_factory_->table_options_.collectPropertiesMinLevel) {
   size_t prevPos = 0;
   size_t nth = 0;
   do {
-    auto entry = iter->value_of<TopFastIndexEntry>();
+    auto entry = cspp_.value_of<TopFastIndexEntry>(*iter);
     if (entry.valueMul) {
       size_t valueNum = entry.valueLen;
       auto posArr = (const uint32_t*)cspp_.mem_get(entry.valuePos);

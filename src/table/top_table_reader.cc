@@ -12,7 +12,9 @@
 #include <terark/util/vm_util.hpp>
 
 #ifdef _MSC_VER
-# define NOMINMAX
+# ifndef NOMINMAX
+#   define NOMINMAX
+# endif
 # define WIN32_LEAN_AND_MEAN  // We only need minimal includes
 # include <Windows.h>
 # undef min
@@ -27,13 +29,18 @@
 #include <linux/mman.h>
 #endif
 
+#if defined(_MSC_VER)
+  #pragma warning(disable: 4102) // 'touch_pages': unreferenced label
+  #pragma warning(disable: 4702) // unreachable code
+#endif
+
 namespace rocksdb {
 
 void MlockBytes(const void* addr, size_t len) {
   auto base = terark::pow2_align_down(uintptr_t(addr), 4096);
   auto size = terark::pow2_align_up(uintptr_t(addr) + len, 4096) - base;
 #if defined(_MSC_VER)
-  VirtualLock((const void*)base, size);
+  VirtualLock((void*)base, size);
 #else
   mlock((const void*)base, size); // ignore error
 #endif

@@ -15,6 +15,9 @@
 #include <rocksdb/merge_operator.h>
 
 // terark headers
+#if defined(_MSC_VER)
+  #pragma warning(disable: 4245) // convert int to size_t in fsa of cspp
+#endif
 #include <terark/fsa/cspptrie.inl>
 #include <terark/io/FileStream.hpp>
 #include <terark/io/MemMapStream.hpp>

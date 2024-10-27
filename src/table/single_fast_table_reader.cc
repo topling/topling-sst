@@ -14,6 +14,10 @@
 #include <table/table_reader.h>
 #include <table/meta_blocks.h>
 #include <util/thread_local.h>
+#if defined(_MSC_VER)
+  #pragma warning(disable: 4245) // convert int to size_t in fsa of cspp
+  #pragma warning(disable: 4673)
+#endif
 #include <terark/fsa/cspptrie.inl>
 #include <terark/num_to_str.hpp>
 #include <terark/thread/fiber_aio.hpp>
@@ -24,6 +28,22 @@
 namespace ROCKSDB_NAMESPACE {
 
 using namespace terark;
+
+#if defined(_MSC_VER)
+// off_t on msvc is uint32
+intptr_t pread(intptr_t fd, void* buf, size_t len, size_t offset) {
+  OVERLAPPED ol{};
+  ol.Offset = DWORD(offset);
+  ol.OffsetHigh = DWORD(offset >> 32);
+  DWORD res = 0;
+  if (ReadFile(HANDLE(fd), buf, DWORD(len), &res, &ol)) {
+    return intptr_t(res);
+  } else {
+    return -1;
+  }
+}
+#define fiber_aio_read pread
+#endif
 
 static void PatriciaIterUnref(void* obj) {
   auto iter = (Patricia::Iterator*)(obj);

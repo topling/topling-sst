@@ -123,6 +123,9 @@ Block* DetachBlockContents(BlockContents &tombstoneBlock, SequenceNumber global_
 void TopTableReaderBase::
 LoadTombstone(RandomAccessFileReader* file, const TableReaderOptions& tro, uint64_t file_size, uint64_t magic)
 try {
+#if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 80100
+  m_icmp = tro.internal_comparator;
+#endif
   BlockContents tombstoneBlock = ReadMetaBlockE(file, file_size, magic,
       tro.ioptions,  kRangeDelBlock);
   TERARK_VERIFY(!tombstoneBlock.data.empty());
@@ -153,6 +156,20 @@ TopTableReaderBase::NewRangeTombstoneIterator(const ReadOptions& ro) {
                           ReverseBytewiseComparator() : BytewiseComparator());
   return new FragmentedRangeTombstoneIterator(fragmented_range_dels_, c, snapshot);
 }
+
+#if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 80100
+FragmentedRangeTombstoneIterator*
+TopTableReaderBase::NewRangeTombstoneIterator
+(SequenceNumber read_seqno, const Slice* timestamp)
+{
+  if (fragmented_range_dels_ == nullptr) {
+    return nullptr;
+  }
+  return new FragmentedRangeTombstoneIterator(fragmented_range_dels_,
+                                              m_icmp,
+                                              read_seqno, timestamp);
+}
+#endif
 
 #if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 60280
 inline

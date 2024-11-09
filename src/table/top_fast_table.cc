@@ -12,6 +12,8 @@
 #include <terark/num_to_str.hpp>
 
 const char* git_version_hash_info_topling_sst();
+const char* git_version_hash_info_core();
+const char* git_version_hash_info_fsa();
 const char* git_version_hash_info_zbs();
 
 namespace ROCKSDB_NAMESPACE {
@@ -126,34 +128,34 @@ ROCKSDB_RegTableFactoryMagicNumber(kSingleFastTableMagic, "SingleFastTable");
 // #define GITHUB_TOPLING_ZIP "https://github.com/rockeet/topling-core"
 void JS_TopTable_AddVersion(json& ver, bool html) {
   if (html) {
-    std::string topling_sst = HtmlEscapeMin(strstr(git_version_hash_info_topling_sst(), "commit ") + strlen("commit "));
-    std::string topling_zip = HtmlEscapeMin(strchr(git_version_hash_info_zbs(), ':') + 1);
     auto headstr = [](const std::string& s, auto pos) {
       return terark::fstring(s.data(), pos - s.begin());
     };
     auto tailstr = [](const std::string& s, auto pos) {
       return terark::fstring(&*pos, s.end() - pos);
     };
-    auto topling_sst_sha_end = std::find_if(topling_sst.begin(), topling_sst.end(), &isspace);
-    auto topling_zip_sha_end = std::find_if(topling_zip.begin(), topling_zip.end(), &isspace);
-    terark::string_appender<> oss_sst, oss_zip;
-    oss_sst|"<pre>"
-           |"<a href='"|GITHUB_TOPLING_SST|"/commit/"
-           |headstr(topling_sst, topling_sst_sha_end)|"'>"
-           |headstr(topling_sst, topling_sst_sha_end)|"</a>"
-           |tailstr(topling_sst, topling_sst_sha_end)
-           |"</pre>";
-    oss_zip|"<pre>"
-           |"<a href='"|GITHUB_TOPLING_ZIP|"/commit/"
-           |headstr(topling_zip, topling_zip_sha_end)|"'>"
-           |headstr(topling_zip, topling_zip_sha_end)|"</a>"
-           |tailstr(topling_zip, topling_zip_sha_end)
-           |"</pre>";
-    ver["topling-sst"] = static_cast<std::string&&>(oss_sst);
-    ver["topling-zip"] = static_cast<std::string&&>(oss_zip);
+    auto get_html = [&](const char* url, const char* git_ver) {
+      std::string oss;
+      std::string sha = HtmlEscapeMin(strstr(git_ver, "commit ") + strlen("commit "));
+      auto sha_end = std::find_if(sha.begin(), sha.end(), &isspace);
+      static_cast<terark::string_appender<>&>(oss)
+        |"<pre>"
+        |"<a href='"|url|"/commit/"
+        |headstr(sha, sha_end)|"'>"
+        |headstr(sha, sha_end)|"</a>"
+        |tailstr(sha, sha_end)
+        |"</pre>";
+      return oss;
+    };
+    ver["topling-sst"] = get_html(GITHUB_TOPLING_SST, git_version_hash_info_topling_sst());
+    ver["topling-zbs"] = get_html(GITHUB_TOPLING_ZIP, git_version_hash_info_zbs());
+    ver["topling-fsa"] = get_html(GITHUB_TOPLING_ZIP, git_version_hash_info_fsa());
+    ver["topling-core"] = get_html(GITHUB_TOPLING_ZIP, git_version_hash_info_core());
   } else {
     ver["topling-sst"] = git_version_hash_info_topling_sst();
-    ver["topling-zip"] = git_version_hash_info_zbs(); // zbs depends on core
+    ver["topling-zbs"] = git_version_hash_info_zbs();
+    ver["topling-fsa"] = git_version_hash_info_fsa();
+    ver["topling-core"] = git_version_hash_info_core();
   }
 }
 struct TopFastTableFactory_Json : TopFastTableFactory {

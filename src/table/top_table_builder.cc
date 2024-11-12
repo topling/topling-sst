@@ -136,6 +136,7 @@ void TopTableBuilderBase::FinishAsEmptyTable() {
   // 2. Magic of EmptyTable is kTopEmptyTableMagicNumber
   BlockHandle emptyBH = WriteBlock(Slice("Empty"), file_, &offset_);
   WriteMeta(kTopEmptyTableMagicNumber, {{kTopEmptyTableKey, emptyBH}});
+  closed_ = true;
 }
 
 static XXH32_state_t* XXH32_init(unsigned int seed) {

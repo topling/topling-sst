@@ -129,10 +129,10 @@ try {
   BlockContents tombstoneBlock = ReadMetaBlockE(file, file_size, magic,
       tro.ioptions,  kRangeDelBlock);
   TERARK_VERIFY(!tombstoneBlock.data.empty());
-  auto  block = DetachBlockContents(tombstoneBlock, GetSequenceNumber());
+  auto  block = DetachBlockContents(tombstoneBlock, kDisableGlobalSequenceNumber);
   auto& icomp = tro.internal_comparator;
   auto* ucomp = icomp.user_comparator();
-  auto  diter = UniquePtrOf(block->NewDataIterator(ucomp, global_seqno_));
+  auto  diter = UniquePtrOf(block->NewDataIterator(ucomp, kDisableGlobalSequenceNumber));
   auto  delfn = [](void* arg0, void*) { delete static_cast<Block*>(arg0); };
   diter->RegisterCleanup(delfn, block, nullptr);
   fragmented_range_dels_ =

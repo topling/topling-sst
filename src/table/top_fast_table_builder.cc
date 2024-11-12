@@ -215,6 +215,7 @@ void TopFastTableBuilder::Add(const Slice& key, const Slice& value) try {
   }
   else if (vt == kTypeRangeDeletion) {
     range_del_block_.Add(key, value);
+    properties_.num_range_deletions++;
   }
   else {
     const char* ename = enum_name(vt).data();
@@ -345,6 +346,7 @@ const std::string kTopFastTableOffsetBlock = "TopFastTableOffsetBlock";
 
 Status TopFastTableBuilder::Finish() try {
   if (0 == num_user_key_ && valueNodeVec_.empty()) {
+    ToplingFlushBuffer();
     FinishAsEmptyTable();
     return Status::OK();
   }

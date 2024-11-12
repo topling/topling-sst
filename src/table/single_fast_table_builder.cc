@@ -186,6 +186,7 @@ void SingleFastTableBuilder::Add(const Slice& key, const Slice& value) try {
   }
   else if (vt == kTypeRangeDeletion) {
     range_del_block_.Add(key, value);
+    properties_.num_range_deletions++;
   }
   else {
     const char* ename = enum_name(vt).data();
@@ -314,6 +315,7 @@ const uint64_t kSingleFastTableMagic = 0x747361466c676e53; // SnglFast
 
 Status SingleFastTableBuilder::Finish() try {
   if (UNLIKELY(0 == num_user_key_)) {
+    ToplingFlushBuffer(); // to detach fd
     FinishAsEmptyTable();
     return Status::OK();
   }

@@ -123,9 +123,7 @@ Block* DetachBlockContents(BlockContents &tombstoneBlock, SequenceNumber global_
 void TopTableReaderBase::
 LoadTombstone(RandomAccessFileReader* file, const TableReaderOptions& tro, uint64_t file_size, uint64_t magic)
 try {
-#if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 80100
   m_icmp = tro.internal_comparator;
-#endif
   BlockContents tombstoneBlock = ReadMetaBlockE(file, file_size, magic,
       tro.ioptions,  kRangeDelBlock);
   TERARK_VERIFY(!tombstoneBlock.data.empty());
@@ -152,9 +150,7 @@ TopTableReaderBase::NewRangeTombstoneIterator(const ReadOptions& ro) {
   if (ro.snapshot != nullptr) {
     snapshot = ro.snapshot->GetSequenceNumber();
   }
-  InternalKeyComparator c(isReverseBytewiseOrder_ ?
-                          ReverseBytewiseComparator() : BytewiseComparator());
-  return new FragmentedRangeTombstoneIterator(fragmented_range_dels_, c, snapshot);
+  return new FragmentedRangeTombstoneIterator(fragmented_range_dels_, m_icmp, snapshot);
 }
 
 #if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 80100
@@ -251,6 +247,23 @@ void TopTableReaderBase::LoadCommonPart(RandomAccessFileReader* file,
        "TopTableReaderBase::LoadCommonPart(%s): global_seqno = %" PRIu64,
        file->file_name().c_str(), global_seqno_);
   LoadTombstone(file, tro, file_size, magic);
+
+  if (this->debugLevel_ >= 1 && fragmented_range_dels_) {
+    auto info_log = tro.ioptions.info_log.get();
+    auto iter = NewRangeTombstoneIterator(ReadOptions());
+    size_t nth = 0;
+    iter->SeekToFirst();
+    while (iter->Valid()) {
+      auto key = iter->key();
+      auto val = iter->value();
+      ParsedInternalKey ikey(key);
+      ROCKS_LOG_DEBUG(info_log, "LoadCommonPart: %3zd: %s -> %s", nth,
+        ikey.DebugString(false, true).c_str(), val.ToString(true).c_str());
+      iter->Next();
+      nth++;
+    }
+    delete iter;
+  }
 }
 
 TopTableReaderBase::~TopTableReaderBase() {

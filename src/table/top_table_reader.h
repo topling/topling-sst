@@ -55,6 +55,7 @@ protected:
 #endif
   SequenceNumber global_seqno_ = kDisableGlobalSequenceNumber;
   Slice file_data_;
+  InternalKeyComparator m_icmp; // FragmentedRangeTombstoneIterator refs icmp
   bool enableApproximateKeyAnchors_ = true;
   bool isReverseBytewiseOrder_ = false;
   bool advise_random_on_open_ = false;
@@ -64,7 +65,6 @@ protected:
 public:
   FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(const ReadOptions&) override;
 #if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 80100
-  InternalKeyComparator m_icmp;
   FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator
   (SequenceNumber/* read_seqno */, const Slice* /* timestamp */) override;
 #endif

@@ -215,6 +215,7 @@ bool SingleFastTableReader::ReadValue(Slice* val, size_t len, size_t offset,
     memcpy(buf, file_data_.data_ + offset, len);
   }
   // trick: extra param arg2 passed to free will be ignored
+  TOPLING_GCC_NOLINT(-Wcast-function-type);
   auto clean = (Cleanable::CleanupFunction)(free);
   pinner->RegisterCleanup(clean, buf, nullptr);
   val->data_ = buf;

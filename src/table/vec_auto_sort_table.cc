@@ -881,7 +881,7 @@ Status VecAutoSortTableReader::Get(const ReadOptions& ro,
     fstring suffix = fstring(pikey.user_key).substr(pref_len_);
     Slice val;
     Cleanable noop_pinner;
-    Cleanable* pinner = ro.pinning_tls ? &noop_pinner : nullptr;
+    Cleanable* pinner = ro.internal_is_in_pinning_section ? &noop_pinner : nullptr;
     if (fixed_key_len_) {
       if (ikey.size_ != size_t(fixed_key_len_)) {
         return st;

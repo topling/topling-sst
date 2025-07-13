@@ -177,7 +177,7 @@ bool SingleFastTableReader::ReadValue(Slice* val, size_t len, size_t offset,
       avg_val_len_ >= unsigned(factory_->table_options_.minPreadLen) &&
       avg_val_len_ <= unsigned(factory_->table_options_.maxPreadLen) &&
       level_ >= factory_->table_options_.minPreadLevel;
-  if (0 == len || (read_options.pinning_tls && !use_pread)) {
+  if (0 == len || (read_options.internal_is_in_pinning_section && !use_pread)) {
     // use mmap with zero copy
     if (UNLIKELY(len >= size_t(factory_->table_options_.maxPreadLen))) {
       MmapWarmUpBytes(file_data_.data_ + offset, len);

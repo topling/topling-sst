@@ -176,7 +176,7 @@ Status TopFastTableReader::Get(const ReadOptions& readOptions,
   const SequenceNumber finding_seq = pikey.sequence;
   Slice val;
   Cleanable noop_pinner;
-  Cleanable* pinner = readOptions.pinning_tls ? &noop_pinner : nullptr;
+  Cleanable* pinner = readOptions.internal_is_in_pinning_section ? &noop_pinner : nullptr;
   if (entry.valueMul) {
     size_t valueNum = entry.valueLen;
     TERARK_ASSERT_GE(valueNum, 2);

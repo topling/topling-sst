@@ -42,6 +42,9 @@ intptr_t pread(intptr_t fd, void* buf, size_t len, size_t offset) {
     return -1;
   }
 }
+#endif
+
+#if defined(_MSC_VER) || defined(__ANDROID__)
 #define fiber_aio_read pread
 #endif
 

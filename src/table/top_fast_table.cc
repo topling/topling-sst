@@ -71,8 +71,6 @@ struct TopFastTableOptions_Json : TopFastTableOptions {
     Update(js, repo);
   }
   void Update(const json& js, const SidePluginRepo&) {
-    //ROCKSDB_JSON_OPT_PROP(js, compressionThreshold);
-    ROCKSDB_JSON_OPT_PROP(js, indexType);
     ROCKSDB_JSON_OPT_PROP(js, keyPrefixLen);
     ROCKSDB_JSON_OPT_SIZE(js, fileWriteBufferSize);
     ROCKSDB_JSON_OPT_ENUM(js, warmupLevel);
@@ -88,8 +86,6 @@ struct TopFastTableOptions_Json : TopFastTableOptions {
     ROCKSDB_JSON_OPT_PROP(js, debugLevel);
   }
   void ToJson(json& djs, const json& dump_options, const SidePluginRepo&) const {
-    //ROCKSDB_JSON_SET_PROP(djs, compressionThreshold);
-    ROCKSDB_JSON_SET_PROP(djs, indexType);
     ROCKSDB_JSON_SET_PROP(djs, keyPrefixLen);
     ROCKSDB_JSON_SET_SIZE(djs, fileWriteBufferSize);
     ROCKSDB_JSON_SET_ENUM(djs, warmupLevel);

@@ -16,8 +16,6 @@ ROCKSDB_ENUM_CLASS(WriteMethod, unsigned char,
   kRocksdbNative, kToplingMmapWrite, kToplingFileWrite
 );
 struct TopFastTableOptions {
-  std::vector<size_t> compessionThreshold;
-  std::string indexType;
   size_t keyPrefixLen = 0;
   uint32_t fileWriteBufferSize = 8 * 1024;
   uint32_t keyAnchorSizeUnit = 0;

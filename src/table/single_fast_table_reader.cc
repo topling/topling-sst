@@ -324,10 +324,8 @@ public:
   const SingleFastTableReader* tab_;
   const char* file_mem_;
   Patricia::Iterator* iter_;
-  typedef bool (*DfaIterScanFN)(ADFA_LexIterator*);
- #if defined(_MSC_VER) || defined(__clang__)
- #else
-  #pragma GCC diagnostic ignored "-Wpmf-conversions"
+  typedef bool (*DfaIterScanFN)(StringLexIterator*);
+ #if TOPLING_USE_BOUND_PMF
   DfaIterScanFN dfa_iter_next_;
   DfaIterScanFN dfa_iter_prev_;
  #endif
@@ -343,15 +341,14 @@ public:
     file_mem_ = table->file_data_.data();
     tab_ = table;
     iter_ = table->cspp_.new_iter();
-   #if defined(_MSC_VER) || defined(__clang__)
-   #else
-    dfa_iter_next_ = (DfaIterScanFN)(iter_->*(&ADFA_LexIterator::incr));
-    dfa_iter_prev_ = (DfaIterScanFN)(iter_->*(&ADFA_LexIterator::decr));
+   #if TOPLING_USE_BOUND_PMF
+    dfa_iter_next_ = ExtractFuncPtr<DfaIterScanFN, StringLexIterator>(iter_, &StringLexIterator::incr);
+    dfa_iter_prev_ = ExtractFuncPtr<DfaIterScanFN, StringLexIterator>(iter_, &StringLexIterator::decr);
    #endif
     global_seqno_ = table->global_seqno_;
     SetInvalid();
   }
- #if defined(_MSC_VER) || defined(__clang__)
+ #if !TOPLING_USE_BOUND_PMF
   bool InvokeDfaIterNext() { return iter_->incr(); }
   bool InvokeDfaIterPrev() { return iter_->decr(); }
  #else

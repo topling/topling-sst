@@ -61,8 +61,54 @@ const std::string kPropertiesBlock = "rocksdb.properties";
 const std::string kRangeDelBlock = "rocksdb.range_del";
 #endif
 
+inline bool BytesEqualMaxLen16(const void* px, const void* py, size_t len) {
+  TERARK_ASSERT_LE(len, 16);
+ #if defined(__AVX512VL__) && defined(__AVX512BW__)
+  __mmask16 msk = _bzhi_u32(-1, uint32_t(len));
+  __m128i   xxx = _mm_maskz_loadu_epi8(msk, px);
+  __m128i   yyy = _mm_maskz_loadu_epi8(msk, py);
+  __mmask16 cmp = _mm_cmpneq_epi8_mask(xxx, yyy);
+  return cmp == 0; // all zero means all eq, any one means not eq
+ #else
+  return memcmp(px, py, len) == 0;
+ #endif
+}
+
+inline bool BytesEqualMaxLen32(const void* px, const void* py, size_t len) {
+  TERARK_ASSERT_LE(len, 32);
+ #if defined(__AVX512VL__) && defined(__AVX512BW__)
+  __mmask32 msk = _bzhi_u32(-1, uint32_t(len));
+  __m256i   xxx = _mm256_maskz_loadu_epi8(msk, px);
+  __m256i   yyy = _mm256_maskz_loadu_epi8(msk, py);
+  __mmask32 cmp = _mm256_cmpneq_epi8_mask(xxx, yyy);
+  return cmp == 0; // all zero means all eq, any one means not eq
+ #else
+  return memcmp(px, py, len) == 0;
+ #endif
+}
+
+inline bool BytesEqualMaxLen64(const void* px, const void* py, size_t len) {
+  TERARK_ASSERT_LE(len, 64);
+ #if defined(__AVX512VL__) && defined(__AVX512BW__)
+  __mmask64 msk = _bzhi_u64(-1, len);
+  __m512i   xxx = _mm512_maskz_loadu_epi8(msk, px);
+  __m512i   yyy = _mm512_maskz_loadu_epi8(msk, py);
+  __mmask64 cmp = _mm512_cmpneq_epi8_mask(xxx, yyy);
+  return cmp == 0; // all zero means all eq, any one means not eq
+ #else
+  return memcmp(px, py, len) == 0;
+ #endif
+}
+
 inline uint64_t ReadBigEndianUint64(const void* beg, size_t len) {
   ROCKSDB_ASSUME(len <= 8);
+ #if defined(__AVX512VL__) && defined(__AVX512BW__)
+  // load 128 bits, keep low 64 bits, discard high 64 bits
+  __mmask16 mask = byte_t(0xFF00 >> len); // ex: 0b1110'0000 -- when len is 3
+  __m128i   m128 = _mm_maskz_loadu_epi8(mask, beg);
+  uint64_t  data = (uint64_t)_mm_extract_epi64(m128, 0);
+  return NATIVE_OF_BIG_ENDIAN(data);
+ #else
   union {
     byte_t bytes[8];
     uint64_t value;
@@ -70,6 +116,7 @@ inline uint64_t ReadBigEndianUint64(const void* beg, size_t len) {
   c.value = 0;  // this is fix for gcc-4.8 union init bug
   memcpy(c.bytes + (8 - len), beg, len);
   return NATIVE_OF_BIG_ENDIAN(c.value);
+ #endif
 }
 inline uint64_t ReadBigEndianUint64(const byte_t* beg, const byte_t* end) {
   assert(end - beg <= 8);
@@ -95,12 +142,19 @@ uint64_t ReadBigEndianUint64Aligned(const byte_t* beg, size_t len) {
 inline void SaveAsBigEndianUint64(byte_t* beg, size_t len, uint64_t value) {
   assert(len <= 8);
   ROCKSDB_ASSUME(len <= 8);
+ #if defined(__AVX512VL__) && defined(__AVX512BW__)
+  value <<= 8 * (8 - len); // move len bytes to high, discard high 8-len bytes
+  value = BIG_ENDIAN_OF(value); // len bytes reversed and lies at front
+  __mmask16 mask = _bzhi_u32(-1, uint32_t(len));
+  _mm_mask_storeu_epi8(beg, mask, _mm_cvtsi64_si128(value));
+ #else
   union {
     byte_t bytes[8];
     uint64_t value;
   } c;
   c.value = BIG_ENDIAN_OF(value);
   memcpy(beg, c.bytes + (8 - len), len);
+ #endif
 }
 
 template<class T>

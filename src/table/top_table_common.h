@@ -53,8 +53,7 @@ using terark::LittleEndianDataOutput;
 
 extern terark::profiling g_pf;
 
-template<class T>
-inline unique_ptr<T> UniquePtrOf(T* p) { return unique_ptr<T>(p); }
+using terark::UniquePtrOf;
 
 #if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 60280
 const std::string kPropertiesBlock = "rocksdb.properties";

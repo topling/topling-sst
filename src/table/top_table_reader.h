@@ -73,6 +73,9 @@ public:
   GetTableProperties() const override { return table_properties_; }
   void SetupForCompaction() override {}
   void Prepare(const Slice& target) override {}
+#if defined(TOPLINGDB_OMIT_LOOKUP_KEY)
+  void PreparePIK(const ParsedInternalKey& pik) override {}
+#endif
 
 #if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 70060
   Status ApproximateKeyAnchors(const ReadOptions&, std::vector<Anchor>&) override;

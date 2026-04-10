@@ -76,6 +76,18 @@ public:
                      const SliceTransform* prefix_extractor,
                      bool skip_filters) final;
 
+#if defined(TOPLINGDB_OMIT_LOOKUP_KEY)
+  Status GetPIK(const ReadOptions& readOptions, const ParsedInternalKey& key,
+                GetContext* get_context,
+                const SliceTransform* prefix_extractor,
+                bool skip_filters) final;
+
+  Status GetPIK_1(const ReadOptions& readOptions, ParsedInternalKey key,
+                  GetContext* get_context,
+                  const SliceTransform* prefix_extractor,
+                  bool skip_filters);
+#endif
+
   Status VerifyChecksum(const ReadOptions&, TableReaderCaller) final;
   bool GetRandomInternalKeysAppend(size_t num, std::vector<std::string>* output) const final;
 #if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 70060
@@ -233,6 +245,22 @@ Status SingleFastTableReader::Get(const ReadOptions& readOptions,
                                   bool skip_filters) {
   ROCKSDB_ASSERT_GE(ikey.size(), kNumInternalBytes);
   ParsedInternalKey pikey(ikey);
+#if defined(TOPLINGDB_OMIT_LOOKUP_KEY)
+  return GetPIK_1(readOptions, pikey, get_context, prefix_extractor, skip_filters);
+}
+Status SingleFastTableReader::GetPIK(const ReadOptions& readOptions,
+              const ParsedInternalKey& pikey,
+              GetContext* get_context,
+              const SliceTransform* prefix_extractor,
+              bool skip_filters) {
+  return GetPIK_1(readOptions, pikey, get_context, prefix_extractor, skip_filters);
+}
+Status SingleFastTableReader::GetPIK_1(const ReadOptions& readOptions,
+              ParsedInternalKey pikey,
+              GetContext* get_context,
+              const SliceTransform* prefix_extractor,
+              bool skip_filters) {
+#endif
   Status st;
   MainPatricia::SingleReaderToken token(&cspp_);
   if (!cspp_.lookup(pikey.user_key, &token)) {

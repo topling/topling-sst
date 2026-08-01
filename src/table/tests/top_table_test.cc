@@ -1,4 +1,4 @@
-// Unit test for SimpleTopTable — cover layout templates and major branches.
+// Unit tests for Top Tables — shared TableFactory semantics and SimpleTop layout coverage.
 //
 // Template instantiations (Reader):
 //   RecAt/UkeyAt/LowerBound/EqualRange/Get/Iter  ×  kFixedKey×kFixedValue
@@ -61,16 +61,19 @@ static void DestroyDBDir(const std::string& dbname) {
   (void)rc;
 }
 
-static std::shared_ptr<TableFactory> MakeFactory(SidePluginRepo& repo) {
+static std::shared_ptr<TableFactory> MakeFactory(SidePluginRepo& repo, const char* factory_name = "SimpleTopTable") {
   json js;
   js["debugLevel"] = 2;
-  auto fac = PluginFactorySP<TableFactory>::AcquirePlugin("SimpleTopTable", js,
-                                                          repo);
+  if (std::string(factory_name) == "ToplingZipTable") {
+    js["debugLevel"] = 0;
+    js["builderMinLevel"] = -1;
+  }
+  auto fac = PluginFactorySP<TableFactory>::AcquirePlugin(factory_name, js, repo);
   EXPECT_TRUE(fac != nullptr);
   return fac;
 }
 
-static Options MakeOptions(SidePluginRepo& repo, bool reverse) {
+static Options MakeOptions(SidePluginRepo& repo, bool reverse, const char* factory_name = "SimpleTopTable") {
   Options options;
   options.create_if_missing = true;
   options.error_if_exists = false;
@@ -79,7 +82,7 @@ static Options MakeOptions(SidePluginRepo& repo, bool reverse) {
   options.allow_mmap_reads = true;
   options.level0_file_num_compaction_trigger = 100;
   options.disable_auto_compactions = true;
-  options.table_factory = MakeFactory(repo);
+  options.table_factory = MakeFactory(repo, factory_name);
   options.compression = kNoCompression;
   options.num_levels = 2;
   options.write_buffer_size = 64 << 20;
@@ -342,7 +345,7 @@ static void RunIngestCase(const char* name, bool reverse, const std::vector<KV>&
   printf("  PASS\n");
 }
 
-TEST(SimpleTopTableTest, Smoke) {
+TEST(TopTableTest, Smoke) {
   // (T,T) dual-fixed empty value
   RunFlushCase("ff_empty", false,
                {{"ka", ""}, {"kb", ""}, {"kc", ""}},
@@ -504,7 +507,7 @@ TEST(SimpleTopTableTest, Smoke) {
 // BBT-inspired extras × all layout templates × reverse × flush/ingest
 // ---------------------------------------------------------------------------
 
-TEST(SimpleTopTableTest, EmptyAndSpecialKey) {
+TEST(TopTableTest, EmptyAndSpecialKey) {
   // Empty ukey (var-key layouts) + same-length 0x00/0xff keys (fixed-key layouts).
   // Stresses LowerBound/EqualRange edges under both comparators.
   ForEachLayoutPath([&](Layout L, bool reverse, BuildPath path) {
@@ -560,7 +563,7 @@ TEST(SimpleTopTableTest, EmptyAndSpecialKey) {
   }
 }
 
-TEST(SimpleTopTableTest, MultiGetAllLayouts) {
+TEST(TopTableTest, MultiGetAllLayouts) {
   ForEachLayoutPath([&](Layout L, bool reverse, BuildPath path) {
     auto kvs = MakeLayoutKVs(L, 32);
     LoadedDB loaded;
@@ -598,7 +601,7 @@ TEST(SimpleTopTableTest, MultiGetAllLayouts) {
   });
 }
 
-TEST(SimpleTopTableTest, IterateBoundsAllLayouts) {
+TEST(TopTableTest, IterateBoundsAllLayouts) {
   ForEachLayoutPath([&](Layout L, bool reverse, BuildPath path) {
     auto kvs = MakeLayoutKVs(L, 16);
     LoadedDB loaded;
@@ -644,7 +647,7 @@ TEST(SimpleTopTableTest, IterateBoundsAllLayouts) {
   });
 }
 
-TEST(SimpleTopTableTest, ApproximateSizesAllLayouts) {
+TEST(TopTableTest, ApproximateSizesAllLayouts) {
   ForEachLayoutPath([&](Layout L, bool reverse, BuildPath path) {
     auto kvs = MakeLayoutKVs(L, 64);
     LoadedDB loaded;
@@ -674,7 +677,7 @@ TEST(SimpleTopTableTest, ApproximateSizesAllLayouts) {
   });
 }
 
-TEST(SimpleTopTableTest, SnapshotMultiVersionAllLayouts) {
+TEST(TopTableTest, SnapshotMultiVersionAllLayouts) {
   // Snapshot must see old value; needs Flush path (memtable→SST with seqnos).
   for (int li = 0; li < 4; ++li) {
     for (bool reverse : {false, true}) {
@@ -712,7 +715,7 @@ TEST(SimpleTopTableTest, SnapshotMultiVersionAllLayouts) {
   }
 }
 
-TEST(SimpleTopTableTest, RangeDeleteAllLayouts) {
+TEST(TopTableTest, RangeDeleteAllLayouts) {
   for (int li = 0; li < 4; ++li) {
     for (bool reverse : {false, true}) {
       Layout L = Layout(li);
@@ -762,7 +765,120 @@ TEST(SimpleTopTableTest, RangeDeleteAllLayouts) {
   }
 }
 
-TEST(SimpleTopTableTest, RandomizedGetIterAllLayouts) {
+class TopTableFactoryTest : public testing::TestWithParam<const char*> {};
+
+TEST_P(TopTableFactoryTest, IngestRangeDeleteUsesGlobalSeqno) {
+  const char* factory_name = GetParam();
+  for (bool reverse : {false, true}) {
+    for (bool empty_table : {false, true}) {
+      LoadedDB loaded;
+      loaded.dbname = std::string("/tmp/top_table_ut_ingest_rdel_") + factory_name + (reverse ? "_rev" : "") +
+                      (empty_table ? "_empty" : "_table");
+      loaded.sst = loaded.dbname + ".sst";
+      DestroyDBDir(loaded.dbname);
+      system(("rm -f '" + loaded.sst + "'").c_str());
+      loaded.options = MakeOptions(loaded.repo, reverse, factory_name);
+      ASSERT_OK(DB::Open(loaded.options, loaded.dbname, &loaded.db));
+
+      ASSERT_OK(loaded.db->Put(WriteOptions(), "m", "old"));
+      ASSERT_OK(loaded.db->Flush(FlushOptions()));
+      const Snapshot* before_ingest = loaded.db->GetSnapshot();
+
+      const char* outside_key = reverse ? "0" : "zz";
+      {
+        SstFileWriter writer(EnvOptions(), loaded.options);
+        ASSERT_OK(writer.Open(loaded.sst));
+        if (reverse) {
+          ASSERT_OK(writer.DeleteRange("z", "a"));
+        } else {
+          ASSERT_OK(writer.DeleteRange("a", "z"));
+        }
+        if (!empty_table) {
+          ASSERT_OK(writer.Put(outside_key, "outside"));
+        }
+        ASSERT_OK(writer.Finish());
+      }
+
+      IngestExternalFileOptions ifo;
+      ifo.allow_global_seqno = true;
+      ASSERT_OK(loaded.db->IngestExternalFile({loaded.sst}, ifo));
+
+      std::string value;
+      ASSERT_TRUE(loaded.db->Get(ReadOptions(), "m", &value).IsNotFound());
+      if (!empty_table) {
+        ASSERT_OK(loaded.db->Get(ReadOptions(), outside_key, &value));
+        ASSERT_EQ(value, "outside");
+      }
+
+      // The tombstone was assigned after this snapshot, so the older value must still be visible through the snapshot.
+      ReadOptions snapshot_read;
+      snapshot_read.snapshot = before_ingest;
+      ASSERT_OK(loaded.db->Get(snapshot_read, "m", &value));
+      ASSERT_EQ(value, "old");
+      loaded.db->ReleaseSnapshot(before_ingest);
+
+      std::unique_ptr<Iterator> iter(loaded.db->NewIterator(ReadOptions()));
+      size_t count = 0;
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        ++count;
+      }
+      ASSERT_OK(iter->status());
+      ASSERT_EQ(count, empty_table ? 0u : 1u);
+    }
+  }
+}
+
+TEST_P(TopTableFactoryTest, RangeDeleteKeepsStoredSeqno) {
+  const char* factory_name = GetParam();
+  for (bool reverse : {false, true}) {
+    for (bool empty_table : {false, true}) {
+      LoadedDB loaded;
+      loaded.dbname = std::string("/tmp/top_table_ut_rdel_seq_") + factory_name + (reverse ? "_rev" : "") +
+                      (empty_table ? "_empty" : "_table");
+      DestroyDBDir(loaded.dbname);
+      loaded.options = MakeOptions(loaded.repo, reverse, factory_name);
+      ASSERT_OK(DB::Open(loaded.options, loaded.dbname, &loaded.db));
+
+      ASSERT_OK(loaded.db->Put(WriteOptions(), "m", "old"));
+      ASSERT_OK(loaded.db->Flush(FlushOptions()));
+      const Snapshot* before_delete = loaded.db->GetSnapshot();
+      ASSERT_OK(loaded.db->DeleteRange(WriteOptions(), loaded.db->DefaultColumnFamily(),
+                                       reverse ? "z" : "a", reverse ? "a" : "z"));
+      const Snapshot* after_delete = loaded.db->GetSnapshot();
+
+      if (empty_table) {
+        ASSERT_OK(loaded.db->DeleteRange(WriteOptions(), loaded.db->DefaultColumnFamily(),
+                                         reverse ? "1" : "x", reverse ? "0" : "zz"));
+      } else {
+        ASSERT_OK(loaded.db->Put(WriteOptions(), reverse ? "0" : "zz", "outside"));
+      }
+      ASSERT_OK(loaded.db->Flush(FlushOptions()));
+
+      std::string value;
+      ReadOptions before_delete_read;
+      before_delete_read.snapshot = before_delete;
+      ASSERT_OK(loaded.db->Get(before_delete_read, "m", &value));
+      ASSERT_EQ(value, "old");
+      loaded.db->ReleaseSnapshot(before_delete);
+
+      ReadOptions snapshot_read;
+      snapshot_read.snapshot = after_delete;
+      ASSERT_TRUE(loaded.db->Get(snapshot_read, "m", &value).IsNotFound());
+      ASSERT_TRUE(loaded.db->Get(ReadOptions(), "m", &value).IsNotFound());
+      loaded.db->ReleaseSnapshot(after_delete);
+    }
+  }
+}
+
+INSTANTIATE_TEST_CASE_P(
+    TableFactories, TopTableFactoryTest,
+#ifdef HAS_TOPLING_ROCKS
+    testing::Values("SimpleTopTable", "SingleFastTable", "ToplingZipTable"));
+#else
+    testing::Values("SimpleTopTable", "SingleFastTable"));
+#endif
+
+TEST(TopTableTest, RandomizedGetIterAllLayouts) {
   ForEachLayoutPath([&](Layout L, bool reverse, BuildPath path) {
     const size_t n = 200;
     auto kvs = MakeLayoutKVs(L, n);
@@ -827,7 +943,7 @@ TEST(SimpleTopTableTest, RandomizedGetIterAllLayouts) {
   });
 }
 
-TEST(SimpleTopTableTest, SingleDeleteAllLayouts) {
+TEST(TopTableTest, SingleDeleteAllLayouts) {
   for (int li = 0; li < 4; ++li) {
     for (bool reverse : {false, true}) {
       Layout L = Layout(li);
@@ -854,7 +970,7 @@ TEST(SimpleTopTableTest, SingleDeleteAllLayouts) {
   }
 }
 
-TEST(SimpleTopTableTest, FileChecksumWhenFactorySet) {
+TEST(TopTableTest, FileChecksumWhenFactorySet) {
   // Builder must force kRocksdbNative and emit a real file checksum.
   for (BuildPath path : {BuildPath::kFlush, BuildPath::kIngest}) {
     for (int li = 0; li < 4; ++li) {

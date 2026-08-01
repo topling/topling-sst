@@ -114,7 +114,9 @@ public:
     uint64_t indexed_num;
     uint64_t record_pool_size;
     uint64_t index_bytes;
-    uint64_t reserved[10];  // 80 bytes, must be zero; for future fields
+    uint64_t min_seqno;
+    uint64_t max_seqno;
+    uint64_t reserved[8];  // 64 bytes, must be zero; for future fields
     Slice Memory() const {
       return {(const char*)this, sizeof(MetaInfo)};
     }
@@ -124,8 +126,9 @@ using MetaInfo = SimpleTopTableFactory::MetaInfo;
 static_assert(sizeof(MetaInfo) == 120);
 static_assert(sizeof(MetaInfo) % 8 == 0);
 static_assert(offsetof(MetaInfo, record_pool_size) % 8 == 0);
-static_assert(offsetof(MetaInfo, reserved) == 40);
-static_assert(sizeof(((MetaInfo*)nullptr)->reserved) == 80);
+static_assert(offsetof(MetaInfo, min_seqno) == 40);
+static_assert(offsetof(MetaInfo, reserved) == 56);
+static_assert(sizeof(((MetaInfo*)nullptr)->reserved) == 64);
 
 /////////////////////////////////////////////////////////////////////////////
 // Builder
@@ -153,6 +156,7 @@ public:
   valvec<uint32_t> keylens_; // internal key len = ukey + 8
   uint32_t min_key_len_ = UINT32_MAX, max_key_len_ = 0; // ikey len
   uint32_t min_val_len_ = UINT32_MAX, max_val_len_ = 0;
+  SequenceNumber min_seqno_ = kMaxSequenceNumber, max_seqno_ = 0;
   long long t0 = 0;
   std::vector<std::pair<std::string, std::string>> kv_debug_;
 };
@@ -256,6 +260,9 @@ void SimpleTopTableBuilder::Add(const Slice& key, const Slice& value) try {
   const auto vt = ValueType(seqvt & 255u);
   TERARK_ASSERT_EZ((vt & 0x80u));
   if (IsValueType(vt)) {
+    const SequenceNumber seqno = seqvt >> 8;
+    minimize(min_seqno_, seqno);
+    maximize(max_seqno_, seqno);
     if (vt == kTypeDeletion || vt == kTypeSingleDeletion) {
       properties_.num_deletions++;
     } else if (vt == kTypeMerge) {
@@ -385,11 +392,13 @@ Status SimpleTopTableBuilder::Finish() try {
   MetaInfo meta{};
   meta.version = 1;
   meta.padding = 0;
-  // reserved[10] zeroed by MetaInfo{}
+  // reserved[8] zeroed by MetaInfo{}
   meta.min_ukey_len = min_key_len_ - 8;
   meta.max_ukey_len = max_key_len_ - 8;
   meta.indexed_num = n;
   meta.record_pool_size = pool_size;
+  meta.min_seqno = min_seqno_;
+  meta.max_seqno = max_seqno_;
 
   if (key_fixed && val_fixed) {
     TERARK_VERIFY(kv_offsets_.empty());
@@ -650,12 +659,12 @@ public:
   template<bool kFixedKey, bool kFixedValue, bool kWithGlobalSeqno> class Iter;
   template<bool kFixedKey, bool kFixedValue>
   InternalIterator* NewIterLayout(Arena* a);
-  template<bool kFixedKey, bool kFixedValue>
-  Status GetLayout(const ReadOptions& ro, const Slice& key,
+  template<bool kFixedKey, bool kFixedValue, bool kWithGlobalSeqno>
+  Status GetTpl(const ReadOptions& ro, const Slice& key,
                    GetContext* get_context);
   static bool NeedGlobalSeqnoRewrite(SequenceNumber gseq) {
     // global_seqno_==0 is equivalent to disable (see LoadCommonPart)
-    return gseq != 0 && gseq != kDisableGlobalSequenceNumber;
+    return gseq != 0;
   }
 };
 
@@ -806,7 +815,8 @@ void SimpleTopTableReader::Open(RandomAccessFileReader* file, Slice file_data,
     BlockContents emptyTableBC = ReadMetaBlockE(
         file, file_size, kTopEmptyTableMagicNumber, tro.ioptions,
         kTopEmptyTableKey);
-    TERARK_VERIFY(!emptyTableBC.data.empty());
+    if (emptyTableBC.data.empty())
+      throw Status::Corruption(ROCKSDB_FUNC, "empty EmptyTable meta block");
     INFO(tro.ioptions.info_log,
          "SimpleTopTableReader::Open: %s is EmptyTable, it's ok\n",
          file->file_name().c_str());
@@ -820,63 +830,89 @@ void SimpleTopTableReader::Open(RandomAccessFileReader* file, Slice file_data,
   BlockContents indexBlock =
       ReadMetaBlockE(file, file_size, kSimpleTopTableMagic, tro.ioptions,
                      kMetaName);
-  TERARK_VERIFY_GE(indexBlock.data.size_, sizeof(MetaInfo));
-  TERARK_VERIFY(!indexBlock.own_bytes());
-  TERARK_VERIFY_GE(indexBlock.data.data_, file_data_.data_);
-  TERARK_VERIFY_LE(indexBlock.data.data_ + sizeof(MetaInfo),
-                   file_data_.data_ + file_data_.size_);
+  if (indexBlock.data.size_ < sizeof(MetaInfo))
+    throw Status::Corruption(ROCKSDB_FUNC, "meta block is too small");
+  if (indexBlock.own_bytes())
+    throw Status::Corruption(ROCKSDB_FUNC, "meta block is not backed by the SST mmap");
+  if (indexBlock.data.data_ < file_data_.data_ ||
+      indexBlock.data.data_ > file_data_.end() ||
+      size_t(file_data_.end() - indexBlock.data.data_) < sizeof(MetaInfo))
+    throw Status::Corruption(ROCKSDB_FUNC, "meta block is outside the SST mmap");
   sstmeta_ = (const MetaInfo*)indexBlock.data.data_;
-  TERARK_VERIFY_EQ(sstmeta_->version, 1u);
+  if (sstmeta_->version != 1)
+    throw Status::Corruption(ROCKSDB_FUNC, "unsupported meta version");
+  if (sstmeta_->min_seqno > sstmeta_->max_seqno ||
+      sstmeta_->max_seqno > kMaxSequenceNumber)
+    throw Status::Corruption(ROCKSDB_FUNC, "invalid seqno range");
   for (auto w : sstmeta_->reserved) {
-    TERARK_VERIFY_EZ(w);
+    if (w != 0)
+      throw Status::Corruption(ROCKSDB_FUNC, "nonzero reserved meta field");
   }
 
   indexed_num_ = sstmeta_->indexed_num;
   record_pool_size_ = sstmeta_->record_pool_size;
   offset_bits_ = sstmeta_->offset_bits;
   keylen_bits_ = sstmeta_->keylen_bits;
-  fixed_key_len_ = int(table_properties_->fixed_key_len);
-  // UINT64_MAX (var-len) → -1 as int (two's complement); 0 = fixed-empty value
-  fixed_value_len_ = int(table_properties_->fixed_value_len);
+  const uint64_t fixed_key_len = table_properties_->fixed_key_len;
+  const uint64_t fixed_value_len = table_properties_->fixed_value_len;
+  if (fixed_key_len > INT_MAX || (fixed_value_len != uint64_t(-1) && fixed_value_len > INT_MAX))
+    throw Status::Corruption(ROCKSDB_FUNC, "fixed key/value length is too large");
+  fixed_key_len_ = int(fixed_key_len);
+  fixed_value_len_ = fixed_value_len == uint64_t(-1) ? -1 : int(fixed_value_len);
 
   // Builder never emits SimpleTop with indexed_num==0 (empty → FinishAsEmptyTable).
-  TERARK_VERIFY_GT(indexed_num_, 0u);
-  TERARK_VERIFY_EQ(table_properties_->tag_size, 8 * indexed_num_);
-  TERARK_VERIFY_LE(offset_bits_, sizeof(size_t) * 8);
-  TERARK_VERIFY_LE(keylen_bits_, sizeof(size_t) * 8);
+  if (indexed_num_ == 0)
+    throw Status::Corruption(ROCKSDB_FUNC, "zero records in non-empty SimpleTopTable");
+  if (indexed_num_ > UINT64_MAX / 8 || table_properties_->tag_size != 8 * indexed_num_)
+    throw Status::Corruption(ROCKSDB_FUNC, "invalid tag size");
+  if (offset_bits_ > sizeof(size_t) * 8 || keylen_bits_ > sizeof(size_t) * 8)
+    throw Status::Corruption(ROCKSDB_FUNC, "invalid index bit width");
+  if (record_pool_size_ > file_data_.size_)
+    throw Status::Corruption(ROCKSDB_FUNC, "record pool is outside the SST mmap");
 
   live_iter_num_ = 0;
 
   // Mode: offset_bits==0 => dual-fixed; else keylen_bits==0 => single-varlen.
   // fixed_value_len_ >= 0: fixed (0 = empty); < 0: variable.
   if (offset_bits_ == 0) {
-    TERARK_VERIFY_EQ(sstmeta_->index_bytes, 0u);
-    TERARK_VERIFY_EQ(keylen_bits_, 0u);
-    TERARK_VERIFY_GT(fixed_key_len_, 0);
-    TERARK_VERIFY_GE(fixed_value_len_, 0);
-    TERARK_VERIFY_EQ(record_pool_size_ % indexed_num_, 0u);
+    if (sstmeta_->index_bytes != 0 || keylen_bits_ != 0)
+      throw Status::Corruption(ROCKSDB_FUNC, "invalid fixed-layout index");
+    if (fixed_key_len_ <= 0 || fixed_value_len_ < 0)
+      throw Status::Corruption(ROCKSDB_FUNC, "invalid fixed-layout key/value length");
+    if (record_pool_size_ % indexed_num_ != 0)
+      throw Status::Corruption(ROCKSDB_FUNC, "fixed-layout record pool is not divisible");
     record_stride_ = record_pool_size_ / indexed_num_;
-    TERARK_VERIFY_GE(record_stride_, size_t(fixed_key_len_));
+    if (record_stride_ < size_t(fixed_key_len_) || record_stride_ - size_t(fixed_key_len_) > INT_MAX)
+      throw Status::Corruption(ROCKSDB_FUNC, "invalid fixed-layout record stride");
     fixed_value_len_ = int(record_stride_ - size_t(fixed_key_len_));
-    TERARK_VERIFY_GE(fixed_value_len_, 0);
   } else {
-    TERARK_VERIFY(sstmeta_->index_bytes != 0);
+    if (sstmeta_->index_bytes == 0)
+      throw Status::Corruption(ROCKSDB_FUNC, "missing variable-layout index");
+    if (record_pool_size_ > SIZE_MAX - 63)
+      throw Status::Corruption(ROCKSDB_FUNC, "record pool size overflow");
     size_t index_base_off = align_up(record_pool_size_, 64);
+    if (index_base_off > file_data_.size_ || sstmeta_->index_bytes > file_data_.size_ - index_base_off)
+      throw Status::Corruption(ROCKSDB_FUNC, "index is outside the SST mmap");
     auto* index_base = (unsigned char*)file_data_.data_ + index_base_off;
     index_bits_.risk_mmap_from(index_base, sstmeta_->index_bytes);
     size_t logical_bits;
     if (keylen_bits_ == 0) {
       // single-varlen: (key fixed & value var) or (key var & value fixed)
-      TERARK_VERIFY((fixed_key_len_ > 0 && fixed_value_len_ < 0) ||
-                    (fixed_key_len_ == 0 && fixed_value_len_ >= 0));
+      if (!((fixed_key_len_ > 0 && fixed_value_len_ < 0) || (fixed_key_len_ == 0 && fixed_value_len_ >= 0)))
+        throw Status::Corruption(ROCKSDB_FUNC, "invalid single-variable layout");
+      if (indexed_num_ == SIZE_MAX || indexed_num_ + 1 > SIZE_MAX / offset_bits_)
+        throw Status::Corruption(ROCKSDB_FUNC, "single-variable index size overflow");
       logical_bits = (indexed_num_ + 1) * offset_bits_;
     } else {
-      TERARK_VERIFY_EQ(fixed_key_len_, 0);
-      TERARK_VERIFY_LT(fixed_value_len_, 0);
-      TERARK_VERIFY(keylen_bits_ != 0);
-      logical_bits = indexed_num_ * (offset_bits_ + keylen_bits_) + offset_bits_;
+      if (fixed_key_len_ != 0 || fixed_value_len_ >= 0)
+        throw Status::Corruption(ROCKSDB_FUNC, "invalid dual-variable layout");
+      const size_t stride = offset_bits_ + keylen_bits_;
+      if (indexed_num_ > (SIZE_MAX - offset_bits_) / stride)
+        throw Status::Corruption(ROCKSDB_FUNC, "dual-variable index size overflow");
+      logical_bits = indexed_num_ * stride + offset_bits_;
     }
-    TERARK_VERIFY_LE(logical_bits, index_bits_.size());
+    if (logical_bits > index_bits_.size())
+      throw Status::Corruption(ROCKSDB_FUNC, "index is shorter than its logical size");
     size_t guard;
     if (keylen_bits_ == 0) {
       guard = index_bits_.get_uint<size_t>(indexed_num_ * offset_bits_,
@@ -885,8 +921,14 @@ void SimpleTopTableReader::Open(RandomAccessFileReader* file, Slice file_data,
       size_t stride = offset_bits_ + keylen_bits_;
       guard = index_bits_.get_uint<size_t>(indexed_num_ * stride, offset_bits_);
     }
-    TERARK_VERIFY_EQ(guard, record_pool_size_);
+    if (guard != record_pool_size_)
+      throw Status::Corruption(ROCKSDB_FUNC, "invalid record-pool guard offset");
   }
+
+  // TableReaderOptions::largest_seqno is only a candidate. A nonzero on-disk seqno means this is not an external all-seq-zero table.
+  if (sstmeta_->max_seqno != 0)
+    global_seqno_ = 0;
+  ApplyGlobalSeqnoToRangeDel(file, tro, file_size, kSimpleTopTableMagic);
 }
 
 SimpleTopTableReader::~SimpleTopTableReader() {
@@ -914,9 +956,9 @@ uint64_t SimpleTopTableReader::ApproximateSize(
   return file_data_.size_ * (hi - lo) / indexed_num_;
 }
 
-template<bool kFixedKey, bool kFixedValue>
-Status SimpleTopTableReader::GetLayout(const ReadOptions& ro, const Slice& key,
-                                       GetContext* get_context) {
+template<bool kFixedKey, bool kFixedValue, bool kWithGlobalSeqno>
+Status SimpleTopTableReader::GetTpl(const ReadOptions& ro, const Slice& key,
+                                    GetContext* get_context) {
   ROCKSDB_ASSERT_GE(key.size(), 8);
   ParsedInternalKey target(key);
   auto [lo, hi] = EqualRangeUkeyLayout<kFixedKey, kFixedValue>(target.user_key);
@@ -927,9 +969,13 @@ Status SimpleTopTableReader::GetLayout(const ReadOptions& ro, const Slice& key,
   for (size_t i = lo; i < hi; i++) {
     Slice ikey, val;
     RecAtTmpl<kFixedKey, kFixedValue>(i, &ikey, &val);
-    ParsedInternalKey pikey(ikey);
-    if (pikey.sequence == 0 && NeedGlobalSeqnoRewrite(global_seqno_)) {
+    ParsedInternalKey pikey;
+    if constexpr (kWithGlobalSeqno) {
+      pikey.user_key = Slice(ikey.data(), ikey.size() - 8);
       pikey.sequence = global_seqno_;
+      pikey.type = ValueType(static_cast<unsigned char>(ikey.data()[ikey.size() - 8]));
+    } else {
+      pikey.FastParseInternalKey(ikey);
     }
     if (pikey.sequence > target.sequence) {
       continue;
@@ -950,12 +996,21 @@ Status SimpleTopTableReader::GetLayout(const ReadOptions& ro, const Slice& key,
 Status SimpleTopTableReader::Get(const ReadOptions& ro, const Slice& key,
                                  GetContext* get_context,
                                  const SliceTransform*, bool) {
-  const bool fk = fixed_key_len_ > 0;
-  const bool fv = fixed_value_len_ >= 0;
-  if (fk && fv) return GetLayout<true, true>(ro, key, get_context);
-  if (fk) return GetLayout<true, false>(ro, key, get_context);
-  if (fv) return GetLayout<false, true>(ro, key, get_context);
-  return GetLayout<false, false>(ro, key, get_context);
+  auto dispatch = 4 * (fixed_key_len_ > 0)
+                + 2 * (fixed_value_len_ >= 0)
+                + 1 * NeedGlobalSeqnoRewrite(global_seqno_)
+                ;
+  switch (dispatch) {
+  case 0b000: return GetTpl<0,0,0>(ro, key, get_context);
+  case 0b001: return GetTpl<0,0,1>(ro, key, get_context);
+  case 0b010: return GetTpl<0,1,0>(ro, key, get_context);
+  case 0b011: return GetTpl<0,1,1>(ro, key, get_context);
+  case 0b100: return GetTpl<1,0,0>(ro, key, get_context);
+  case 0b101: return GetTpl<1,0,1>(ro, key, get_context);
+  case 0b110: return GetTpl<1,1,0>(ro, key, get_context);
+  case 0b111: return GetTpl<1,1,1>(ro, key, get_context);
+  default: TERARK_DIE("invalid dispatch = %u", dispatch);
+  }
 }
 
 std::string SimpleTopTableReader::ToWebViewString(const json&) const {
@@ -977,11 +1032,10 @@ struct SimpleTopIterSeqno {
   SequenceNumber global_seqno = 0;
   char* key_buf = nullptr;
   Slice Rewrite(Slice ikey) {
-    uint64_t tag = DecodeFixed64(ikey.data() + ikey.size() - 8);
-    if ((tag >> 8) != 0) return ikey;
     memcpy(key_buf, ikey.data(), ikey.size());
+    auto type = ValueType(static_cast<unsigned char>(ikey.data()[ikey.size() - 8]));
     EncodeFixed64(key_buf + ikey.size() - 8,
-                  PackSequenceAndType(global_seqno, ValueType(tag & 0xff)));
+                  PackSequenceAndType(global_seqno, type));
     return Slice(key_buf, ikey.size());
   }
 };
@@ -1084,7 +1138,12 @@ public:
       Slice cur_ukey(ikey.data(), ikey.size() - 8);
       if (ucmp(cur_ukey, ukey) != 0) break;
       // icmp(ikey, target) <=> ikey < target; stop when ikey >= target
-      if (!icmp(ikey, target)) break;
+      if constexpr (kWithGlobalSeqno) {
+        auto type = ValueType(static_cast<unsigned char>(ikey.data()[ikey.size() - 8]));
+        if (!icmp(ParsedInternalKey(cur_ukey, seq_.global_seqno, type), target)) break;
+      } else {
+        if (!icmp(ikey, target)) break;
+      }
       lo++;
     }
     idx_ = intptr_t(lo);

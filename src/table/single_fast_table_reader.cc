@@ -826,6 +826,7 @@ void SingleFastTableReader::Open(RandomAccessFileReader* file, Slice file_data,
     // special case: if entry.valueMul, global_seqno_ must be 0
     global_seqno_ = 0;
   }
+  ApplyGlobalSeqnoToRangeDel(file, tro, file_size, kSingleFastTableMagic);
   auto props = table_properties_.get();
   if (0 == props->tag_size) {
     auto entries = props->num_entries;

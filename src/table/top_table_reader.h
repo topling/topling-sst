@@ -61,6 +61,7 @@ protected:
   bool advise_random_on_open_ = false;
   int debugLevel_ = 0;
   void LoadTombstone(RandomAccessFileReader*, const TableReaderOptions&, uint64_t file_size, uint64_t magic);
+  void ApplyGlobalSeqnoToRangeDel(RandomAccessFileReader*, const TableReaderOptions&, uint64_t file_size, uint64_t magic);
 
 public:
   FragmentedRangeTombstoneIterator* NewRangeTombstoneIterator(const ReadOptions&) override;

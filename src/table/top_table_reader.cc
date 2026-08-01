@@ -141,6 +141,19 @@ catch (const Status&) {
   // it is confused with real error
 }
 
+void TopTableReaderBase::
+ApplyGlobalSeqnoToRangeDel(RandomAccessFileReader* file, const TableReaderOptions& tro, uint64_t file_size, uint64_t magic) {
+  if (global_seqno_ == 0 || fragmented_range_dels_ == nullptr)
+    return;
+
+  BlockContents contents = ReadMetaBlockE(file, file_size, magic, tro.ioptions, kRangeDelBlock);
+  auto block = UniquePtrOf(DetachBlockContents(contents, kDisableGlobalSequenceNumber));
+  auto iter = UniquePtrOf(block->NewDataIterator(tro.internal_comparator.user_comparator(), global_seqno_));
+  auto delete_block = [](void* arg, void*) { delete static_cast<Block*>(arg); };
+  iter->RegisterCleanup(delete_block, block.release(), nullptr);
+  fragmented_range_dels_ = std::make_shared<FragmentedRangeTombstoneList>(std::move(iter), tro.internal_comparator);
+}
+
 FragmentedRangeTombstoneIterator*
 TopTableReaderBase::NewRangeTombstoneIterator(const ReadOptions& ro) {
   if (fragmented_range_dels_ == nullptr) {
@@ -310,6 +323,20 @@ InternalIterator* TopTableReaderBase::EasyNewIter() {
 void
 TopEmptyTableReader::Open(RandomAccessFileReader* file, Slice file_data, const TableReaderOptions& tro) {
   LoadCommonPart(file, tro, file_data, kTopEmptyTableMagicNumber);
+  if (global_seqno_ != 0 && fragmented_range_dels_ != nullptr) {
+    bool all_seqno_zero = true;
+    for (auto seq = fragmented_range_dels_->seq_begin(); seq != fragmented_range_dels_->seq_end(); ++seq) {
+      if (*seq != 0) {
+        all_seqno_zero = false;
+        break;
+      }
+    }
+    if (all_seqno_zero) {
+      ApplyGlobalSeqnoToRangeDel(file, tro, file_data.size_, kTopEmptyTableMagicNumber);
+    } else {
+      global_seqno_ = 0;
+    }
+  }
   auto props = table_properties_.get();
   ROCKS_LOG_DEBUG(tro.ioptions.info_log
     , "TopEmptyTableReader::Open(%s): fsize = %zd, entries = %zd keys = 0 indexSize = 0 valueSize = 0, warm up time = 0.000'sec, build cache time =      0.000'sec\n"

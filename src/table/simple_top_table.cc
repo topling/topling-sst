@@ -272,7 +272,7 @@ void SimpleTopTableBuilder::Add(const Slice& key, const Slice& value) try {
     } else if (vt == kTypeMerge) {
       properties_.num_merge_operands++;
     }
-    if (debugLevel_ >= 2 && !kv_debug_.empty()) {
+    if (UNLIKELY(debugLevel_ >= 2) && !kv_debug_.empty()) {
       Slice prev = kv_debug_.back().first;
       if (isReverseBytewiseOrder_) {
         TERARK_VERIFY(RevBytewiseCompareInternalKey()(prev, key));
@@ -299,7 +299,7 @@ void SimpleTopTableBuilder::Add(const Slice& key, const Slice& value) try {
     const bool need_index =
         (min_key_len_ != max_key_len_) || (min_val_len_ != max_val_len_);
     if (need_index) {
-      if (kv_offsets_.empty()) {
+      if (UNLIKELY(kv_offsets_.empty())) {
         // previous entries were dual-fixed — reconstruct arithmetic offsets
         TERARK_VERIFY(key_fixed_before && val_fixed_before);
         const size_t stride = size_t(prev_key_lo) + size_t(prev_val_lo);
@@ -312,7 +312,7 @@ void SimpleTopTableBuilder::Add(const Slice& key, const Slice& value) try {
       }
       kv_offsets_.push_back(kv_off);
       if (min_key_len_ != max_key_len_ && min_val_len_ != max_val_len_) {
-        if (keylens_.empty()) {
+        if (UNLIKELY(keylens_.empty())) {
           keylens_.reserve(std::max(size_t(4096), properties_.num_entries + 1));
           if (key_fixed_before) {
             keylens_.resize_fill(properties_.num_entries, prev_key_lo);

@@ -149,6 +149,8 @@ public:
 
   const SimpleTopTableFactory* table_factory_;
   WriteMethod writeMethod_;
+  bool collectProperties_;
+  bool forceNeedCompact_;
   OsFileStream fstream_;
   OutputBuffer fobuf_;
   MemMapStream fmap_;
@@ -182,6 +184,8 @@ SimpleTopTableBuilder::SimpleTopTableBuilder(
   properties_.compression_name = "SimpTop";
   debugLevel_ = (signed char)table_factory->debugLevel;
   writeMethod_ = table_factory->writeMethod;
+  collectProperties_ = table_factory->collectProperties;
+  forceNeedCompact_ = table_factory->forceNeedCompact;
   if (ioptions_.file_checksum_gen_factory) {
     if (WriteMethod::kRocksdbNative != writeMethod_) {
       WARN(ioptions_.info_log,
@@ -328,7 +332,7 @@ void SimpleTopTableBuilder::Add(const Slice& key, const Slice& value) try {
     properties_.num_entries++;
     properties_.raw_key_size += key.size();
     properties_.raw_value_size += value.size();
-    if (table_factory_->collectProperties) {
+    if (collectProperties_) {
       NotifyCollectTableCollectorsOnAdd(key, value, kv_off, collectors_,
                                         ioptions_.info_log.get());
     }
@@ -362,7 +366,7 @@ catch (const std::exception& ex) {
 }
 
 bool SimpleTopTableBuilder::NeedCompact() const {
-  if (table_factory_->forceNeedCompact) {
+  if (forceNeedCompact_) {
     return true;
   }
   return TopTableBuilderBase::NeedCompact();

@@ -7,7 +7,8 @@
 // Runtime branches: reverse comparator, multi-version, deletion Get,
 //   FinishAsEmptyTable, lazy kv_offsets_/keylens_ backfill transitions.
 // Extra (BBT-inspired): empty/special key, MultiGet, iterate bounds,
-//   ApproximateSizes, Snapshot, RangeDelete, randomized sets — each × layouts.
+//   ApproximateSizes, ApproximateKeyAnchors, Snapshot, RangeDelete,
+//   randomized sets — each × layouts.
 // debugLevel=2 → DebugCheckTable (iter/Seek/Get) on each built SST.
 
 #include <rocksdb/db.h>
@@ -674,6 +675,57 @@ TEST(TopTableTest, ApproximateSizesAllLayouts) {
       prev = sz;
       if (HasFatalFailure()) return;
     }
+  });
+}
+
+TEST(TopTableTest, ApproximateKeyAnchorsAllLayouts) {
+  // Exact range_size from record-pool offsets (not file_size/num average).
+  ForEachLayoutPath([&](Layout L, bool reverse, BuildPath path) {
+    constexpr size_t kN = 300;  // >128 ⇒ samples; also covers dual-var strides
+    auto kvs = MakeLayoutKVs(L, kN);
+    LoadedDB loaded;
+    LoadDB(&loaded, "anchors", L, reverse, path, kvs);
+    ASSERT_FALSE(HasFatalFailure());
+
+    auto ordered = loaded.kvs;
+    SortForComparator(&ordered, reverse);
+    std::vector<size_t> ends;  // exclusive end offset after record i
+    ends.reserve(ordered.size());
+    size_t pool = 0;
+    for (auto& kv : ordered) {
+      pool += kv.first.size() + 8 + kv.second.size();  // ikey|value
+      ends.push_back(pool);
+    }
+
+    std::vector<LiveFileMetaData> metas;
+    loaded.db->GetLiveFilesMetaData(&metas);
+    ASSERT_FALSE(metas.empty());
+    Range full(metas[0].smallestkey, metas[0].largestkey);
+    std::vector<Anchor> anchors;
+    ASSERT_OK(loaded.db->ApproximateKeyAnchors(loaded.db->DefaultColumnFamily(),
+                                               &full, &anchors));
+
+    const size_t sum = ordered.size();
+    const size_t num = std::min(sum, size_t{128});
+    ASSERT_EQ(anchors.size(), num);
+    const double step = double(sum) / num;
+    size_t prev_off = 0;
+    size_t sum_ranges = 0;
+    for (size_t i = 0; i < num; ++i) {
+      const size_t nth = std::min(size_t(step * (i + 1)), sum) - 1;
+      const size_t curr_off = ends[nth];
+      ASSERT_EQ(std::string(anchors[i].user_key), ordered[nth].first)
+          << "layout=" << LayoutName(L) << " rev=" << reverse
+          << " path=" << int(path) << " i=" << i;
+      ASSERT_EQ(anchors[i].range_size, curr_off - prev_off)
+          << "layout=" << LayoutName(L) << " rev=" << reverse
+          << " path=" << int(path) << " i=" << i;
+      sum_ranges += anchors[i].range_size;
+      prev_off = curr_off;
+      if (HasFatalFailure()) return;
+    }
+    ASSERT_EQ(sum_ranges, pool);
+    ASSERT_EQ(prev_off, pool);
   });
 }
 

@@ -619,6 +619,9 @@ public:
                                const Slice& key, TableReaderCaller) final;
   uint64_t ApproximateSize(ROCKSDB_8_X_COMMA(const ReadOptions& readopt)
                            const Slice&, const Slice&, TableReaderCaller) final;
+#if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 70060
+  Status ApproximateKeyAnchors(const ReadOptions&, std::vector<Anchor>&) final;
+#endif
   Status Get(const ReadOptions& readOptions, const Slice& key,
              GetContext* get_context, const SliceTransform* prefix_extractor,
              bool skip_filters) final;
@@ -959,6 +962,47 @@ uint64_t SimpleTopTableReader::ApproximateSize(
   if (hi < lo) std::swap(lo, hi);
   return file_data_.size_ * (hi - lo) / indexed_num_;
 }
+
+#if (ROCKSDB_MAJOR * 10000 + ROCKSDB_MINOR * 10 + ROCKSDB_PATCH) >= 70060
+Status SimpleTopTableReader::ApproximateKeyAnchors(
+    const ReadOptions&, std::vector<Anchor>& anchors) {
+  if (indexed_num_ == 0) {
+    return Status::OK();
+  }
+  static constexpr size_t kMaxNumAnchors = 128;
+  const size_t sum = indexed_num_;
+  const size_t num = std::min(sum, kMaxNumAnchors);
+  const double step = double(sum) / num;
+  const bool fk = fixed_key_len_ > 0;
+  const bool fv = fixed_value_len_ >= 0;
+  // i in [0, indexed_num_]: start of record i; i==indexed_num_ → pool end
+  auto rec_off = [this, fk, fv](size_t i) -> size_t {
+    TERARK_ASSERT_LE(i, indexed_num_);
+    if (i == indexed_num_) return record_pool_size_;
+    if (fk && fv) return i * record_stride_;
+    if (fk || fv)
+      return index_bits_.get_uint<size_t>(i * offset_bits_, offset_bits_);
+    const size_t stride = offset_bits_ + keylen_bits_;
+    return index_bits_.get_uint<size_t>(i * stride, offset_bits_);
+  };
+  auto ukey_at = [this, fk, fv](size_t i) -> Slice {
+    if (fk && fv) return UkeyAtTmpl<true, true>(i);
+    if (fk) return UkeyAtTmpl<true, false>(i);
+    if (fv) return UkeyAtTmpl<false, true>(i);
+    return UkeyAtTmpl<false, false>(i);
+  };
+  anchors.reserve(num);
+  size_t prev_off = 0;
+  for (size_t i = 0; i < num; i++) {
+    size_t nth = std::min(size_t(step * (i + 1)), sum) - 1;
+    size_t curr_off = rec_off(nth + 1); // exclusive end of record nth
+    ROCKSDB_VERIFY_GE(curr_off, prev_off);
+    anchors.emplace_back(ukey_at(nth), curr_off - prev_off);
+    prev_off = curr_off;
+  }
+  return Status::OK();
+}
+#endif
 
 template<bool kFixedKey, bool kFixedValue, bool kWithGlobalSeqno>
 Status SimpleTopTableReader::GetTpl(const ReadOptions& ro, const Slice& key,

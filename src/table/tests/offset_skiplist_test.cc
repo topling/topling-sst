@@ -257,6 +257,7 @@ TEST_F(OffsetSkipTest, InsertAndLookup) {
   tok->release();
   list.TEST_Validate();
   ASSERT_GT(list.mem_size(), 0U);
+  list.set_readonly();
   ASSERT_EQ(list.num_nodes(), keys.size());
 }
 
@@ -304,6 +305,7 @@ TEST_F(OffsetSkipTest, ConcurrentInsert) {
     }
   }
   list.TEST_Validate();
+  list.set_readonly();
   ASSERT_EQ(list.num_nodes(), static_cast<uint64_t>(T) * N);
 }
 
@@ -327,6 +329,7 @@ TEST_F(OffsetSkipTest, InsertDuplicateFreesUnused) {
     ScopedPin pin(&list);
     ASSERT_TRUE(list.Contains(key, pin.tok));
   }
+  list.set_readonly();
   ASSERT_EQ(list.num_nodes(), 1U);
   list.TEST_Validate();
 }
@@ -598,8 +601,8 @@ static std::vector<Key> CollectOrder(TestOffsetSkipList* list) {
   return out;
 }
 
-// Stale prev loc > key. Old LinkFromSplice treated the loc as a stable
-// Node* and linked after 30 (10,20,30,15). New recomputes from head.
+// Stale prev loc > key. Old LinkFromSplice treated the loc as stable
+// and linked after 30 (10,20,30,15). New recomputes from head.
 TEST_F(OffsetSkipTest, StaleSplicePrevGreaterThanKey) {
   TestComparator cmp;
   {
@@ -614,7 +617,7 @@ TEST_F(OffsetSkipTest, StaleSplicePrevGreaterThanKey) {
     auto* splice = tok->m_splice_hint;
     splice->prev[0] = old_list.TEST_LocOf(k30);
     splice->next[0] = TestOffsetSkipList::nil;
-    ASSERT_EQ(old_list.TEST_InsertSkipPrepareLegacy(k15, splice), nullptr);
+    ASSERT_EQ(old_list.TEST_InsertSkipPrepareLegacy(k15, splice, tok), nullptr);
     ASSERT_EQ(CollectOrder(&old_list), (std::vector<Key>{10, 20, 30, 15}));
   }
   {
@@ -629,7 +632,7 @@ TEST_F(OffsetSkipTest, StaleSplicePrevGreaterThanKey) {
     auto* splice = tok->m_splice_hint;
     splice->prev[0] = list.TEST_LocOf(k30);
     splice->next[0] = TestOffsetSkipList::nil;
-    ASSERT_EQ(list.TEST_InsertSkipPrepare(k15, splice), nullptr);
+    ASSERT_EQ(list.TEST_InsertSkipPrepare(k15, splice, tok), nullptr);
     Key v15 = 15;
     {
       ScopedPin pin(&list);
@@ -656,7 +659,7 @@ TEST_F(OffsetSkipTest, StaleSpliceNextLessThanKey) {
     auto* splice = tok->m_splice_hint;
     splice->prev[0] = old_list.TEST_LocOf(k10);
     splice->next[0] = old_list.TEST_LocOf(k20);
-    ASSERT_EQ(old_list.TEST_InsertSkipPrepareLegacy(k25, splice), nullptr);
+    ASSERT_EQ(old_list.TEST_InsertSkipPrepareLegacy(k25, splice, tok), nullptr);
     ASSERT_EQ(CollectOrder(&old_list), (std::vector<Key>{10, 25, 20, 30}));
   }
   {
@@ -672,7 +675,7 @@ TEST_F(OffsetSkipTest, StaleSpliceNextLessThanKey) {
     auto* splice = tok->m_splice_hint;
     splice->prev[0] = list.TEST_LocOf(k10);
     splice->next[0] = list.TEST_LocOf(k20);
-    ASSERT_EQ(list.TEST_InsertSkipPrepare(k25, splice), nullptr);
+    ASSERT_EQ(list.TEST_InsertSkipPrepare(k25, splice, tok), nullptr);
     Key v25 = 25;
     {
       ScopedPin pin(&list);
@@ -723,7 +726,8 @@ TEST_F(OffsetSkipTest, StaleSplicePrevIsDuplicate) {
     auto* splice = tok->m_splice_hint;
     splice->prev[0] = old_list.TEST_LocOf(first);
     splice->next[0] = TestOffsetSkipList::nil;
-    ASSERT_EQ(old_list.TEST_InsertSkipPrepareLegacy(dup, splice), nullptr);
+    ASSERT_EQ(old_list.TEST_InsertSkipPrepareLegacy(dup, splice, tok), nullptr);
+    old_list.set_readonly();
     ASSERT_EQ(old_list.num_nodes(), 2U);
     ASSERT_EQ(CollectOrder(&old_list), (std::vector<Key>{10, 10}));
   }
@@ -737,8 +741,9 @@ TEST_F(OffsetSkipTest, StaleSplicePrevIsDuplicate) {
     auto* splice = tok->m_splice_hint;
     splice->prev[0] = list.TEST_LocOf(first);
     splice->next[0] = TestOffsetSkipList::nil;
-    ASSERT_EQ(list.TEST_InsertSkipPrepare(dup, splice), first);
+    ASSERT_EQ(list.TEST_InsertSkipPrepare(dup, splice, tok), first);
     list.FreeUnusedKey(dup, sizeof(Key));
+    list.set_readonly();
     ASSERT_EQ(list.num_nodes(), 1U);
     ASSERT_EQ(CollectOrder(&list), (std::vector<Key>{10}));
     list.TEST_Validate();
@@ -888,6 +893,7 @@ TEST_F(OffsetSkipTest, AttachReadonlySeesKeys) {
   TestOffsetSkipList src(cmp, kTestMemCap);
   Insert(&src, 10);
   Insert(&src, 20);
+  src.set_readonly();
   const size_t prefix =
       sizeof(TestOffsetSkipList::link_t) * size_t(src.max_height() - 1);
   ASSERT_GE(size_t(src.head_loc()) * src.mem_align_size(), prefix);

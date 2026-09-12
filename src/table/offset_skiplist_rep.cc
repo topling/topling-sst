@@ -90,7 +90,7 @@ struct OffsetSkipListMeta {
   int32_t max_height;
   int32_t k_max_height;
   int32_t k_branching;
-  uint64_t num_user_keys;  // on-disk name; value is num_nodes()
+  uint64_t num_user_keys;  // on-disk name; value is slow_exact_num_nodes()
 };
 #pragma pack(pop)
 
@@ -187,6 +187,7 @@ class OffsetSkipListRep : public MemTableRep {
   virtual const std::string& sl_mmap_fpath() const = 0;
   virtual fstring sl_get_mmap() const = 0;
   virtual void sl_set_readonly() = 0;
+  virtual uint64_t sl_slow_exact_num_nodes() const = 0;
   virtual void FlushAllWalTls() = 0;
   void BindFactoryTokenOpts();
 
@@ -417,6 +418,9 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   }
   fstring sl_get_mmap() const final { return skip_list_.get_mmap(); }
   void sl_set_readonly() final { skip_list_.set_readonly(); }
+  uint64_t sl_slow_exact_num_nodes() const final {
+    return skip_list_.slow_exact_num_nodes();
+  }
 
   void ApplyWalToken(Token* tok) {
     for (size_t i = 0; i < num_wals_; ++i) {
@@ -504,8 +508,8 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
 
   const char* FindNode(Slice ukey, typename OffsetSL::Token* tok) const {
     auto found = skip_list_.FindGreaterOrEqual(ukey, tok);
-    if (found.first != nullptr && found.second == 0) {
-      return found.first->Key();
+    if (found.first != OffsetSL::nil && found.second == 0) {
+      return skip_list_.KeyOf(found.first);
     }
     return nullptr;
   }
@@ -766,7 +770,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     m->max_height = skip_list_.max_height();
     m->k_max_height = skip_list_.k_max_height();
     m->k_branching = skip_list_.k_branching();
-    m->num_user_keys = skip_list_.num_nodes();
+    m->num_user_keys = skip_list_.slow_exact_num_nodes();
   }
 
   KeyHandle Allocate(const size_t, char**) override { TERARK_DIE("Bad call"); }
@@ -992,7 +996,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
 
   void FillTableProperties(TableProperties* p) const override {
     const size_t num_entries = p->num_entries;
-    const size_t num_user_keys = skip_list_.num_nodes();
+    const size_t num_user_keys = skip_list_.slow_exact_num_nodes();
     p->tag_size = 8 * num_entries;
     const size_t vec_hdr = sizeof(ValueVec) * num_user_keys;
     if (ref_to_wal_ == OSLLogRefFormat::kPlainLogRef) {

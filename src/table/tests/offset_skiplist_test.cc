@@ -109,20 +109,22 @@ struct ScopedPin {
 class OffsetSkipTest : public testing::Test {
  public:
   void Insert(TestOffsetSkipList* list, Key key) {
-    char* buf = list->AllocateKey(sizeof(Key));
+    auto* tc = list->tls_get();
+    char* buf = list->AllocateKey(sizeof(Key), tc);
     ASSERT_NE(buf, nullptr);
     memcpy(buf, &key, sizeof(Key));
-    ASSERT_EQ(list->Insert(buf, EnsureAcquired(list)), nullptr);
+    EnsureAcquired(list);
+    ASSERT_EQ(list->Insert(buf, tc), nullptr);
     keys_.insert(key);
   }
 
-  bool InsertWithHint(TestOffsetSkipList* list, Key key,
-                      TestOffsetSkipList::Token* token) {
-    char* buf = list->AllocateKey(sizeof(Key));
+  bool InsertWithHint(TestOffsetSkipList* list, Key key) {
+    auto* tc = list->tls_get();
+    char* buf = list->AllocateKey(sizeof(Key), tc);
     EXPECT_NE(buf, nullptr);
     memcpy(buf, &key, sizeof(Key));
-    bool res =
-        list->InsertWithHint(buf, EnsureAcquired(list, token)) == nullptr;
+    EnsureAcquired(list);
+    bool res = list->InsertWithHint(buf, tc) == nullptr;
     keys_.insert(key);
     return res;
   }
@@ -130,8 +132,8 @@ class OffsetSkipTest : public testing::Test {
   void Validate(TestOffsetSkipList* list) {
     ScopedPin pin(list);
     for (Key key : keys_) {
-      ASSERT_TRUE(list->Contains(key, pin.tok));
-      ASSERT_NE(list->Get(key, pin.tok), nullptr);
+      ASSERT_TRUE(list->Contains(key));
+      ASSERT_NE(list->Get(key), nullptr);
     }
     TestOffsetSkipList::Iterator iter(list);
     ASSERT_FALSE(iter.Valid());
@@ -150,13 +152,30 @@ class OffsetSkipTest : public testing::Test {
   std::set<Key> keys_;
 };
 
+TEST_F(OffsetSkipTest, InsertWithoutTokenWhenGcOff) {
+  TestComparator cmp;
+  TestOffsetSkipList list(cmp, kTestMemCap);
+  list.set_gc_enabled(false);
+  Key key = 7;
+  auto* tc = list.tls_get();
+  char* buf = list.AllocateKey(sizeof(Key), tc);
+  ASSERT_NE(buf, nullptr);
+  memcpy(buf, &key, sizeof(Key));
+  ASSERT_EQ(list.Insert(buf, tc), nullptr);
+  TestOffsetSkipList::NoPinIterator iter(&list);
+  iter.Seek(key);
+  ASSERT_TRUE(iter.Valid());
+  ASSERT_EQ(Decode(iter.key()), key);
+  ASSERT_EQ(list.num_nodes(), 1U);
+}
+
 TEST_F(OffsetSkipTest, Empty) {
   TestComparator cmp;
   TestOffsetSkipList list(cmp, kTestMemCap);
   ScopedPin pin(&list);
   Key key = 10;
-  ASSERT_TRUE(!list.Contains(key, pin.tok));
-  ASSERT_EQ(list.Get(key, pin.tok), nullptr);
+  ASSERT_TRUE(!list.Contains(key));
+  ASSERT_EQ(list.Get(key), nullptr);
   ASSERT_EQ(list.mem_align_size(), 4U);
   ASSERT_GT(list.mem_capacity(), 0U);
 
@@ -184,21 +203,22 @@ TEST_F(OffsetSkipTest, InsertAndLookup) {
   for (int i = 0; i < N; i++) {
     Key key = rnd.Next() % R;
     if (keys.insert(key).second) {
-      char* buf = list.AllocateKey(sizeof(Key));
+      auto* tc = list.tls_get();
+      char* buf = list.AllocateKey(sizeof(Key), tc);
       ASSERT_NE(buf, nullptr);
       auto off = buf - reinterpret_cast<const char*>(list.mem_data());
       ASSERT_EQ(off % 4, 0);
       memcpy(buf, &key, sizeof(Key));
-      ASSERT_EQ(list.Insert(buf, tok), nullptr);
+      ASSERT_EQ(list.Insert(buf, tc), nullptr);
     }
   }
   for (Key i = 0; i < R; i++) {
-    if (list.Contains(i, tok)) {
+    if (list.Contains(i)) {
       ASSERT_EQ(keys.count(i), 1U);
-      ASSERT_NE(list.Get(i, tok), nullptr);
+      ASSERT_NE(list.Get(i), nullptr);
     } else {
       ASSERT_EQ(keys.count(i), 0U);
-      ASSERT_EQ(list.Get(i, tok), nullptr);
+      ASSERT_EQ(list.Get(i), nullptr);
     }
   }
 
@@ -265,10 +285,11 @@ TEST_F(OffsetSkipTest, InsertWithHint_Sequential) {
   const int N = 20000;
   TestComparator cmp;
   TestOffsetSkipList list(cmp, kTestMemCap);
-  auto* tok = EnsureAcquired(&list);
+  EnsureAcquired(&list);
   for (int i = 0; i < N; i++) {
-    InsertWithHint(&list, static_cast<Key>(i), tok);
+    InsertWithHint(&list, static_cast<Key>(i));
   }
+  list.FinishHint(list.tls_get());
   Validate(&list);
 }
 
@@ -284,10 +305,11 @@ TEST_F(OffsetSkipTest, ConcurrentInsert) {
       auto* tok = EnsureAcquired(&list);
       for (int i = 0; i < N; i++) {
         Key key = static_cast<Key>(t) * N + i;
-        char* buf = list.AllocateKey(sizeof(Key));
+        auto* tc = list.tls_get();
+        char* buf = list.AllocateKey(sizeof(Key), tc);
         ASSERT_NE(buf, nullptr);
         memcpy(buf, &key, sizeof(Key));
-        ASSERT_EQ(list.InsertConcurrently(buf, tok), nullptr);
+        ASSERT_EQ(list.InsertConcurrently(buf, tc), nullptr);
       }
       tok->idle();
     });
@@ -300,7 +322,7 @@ TEST_F(OffsetSkipTest, ConcurrentInsert) {
     for (int t = 0; t < T; t++) {
       for (int i = 0; i < N; i++) {
         Key key = static_cast<Key>(t) * N + i;
-        ASSERT_TRUE(list.Contains(key, pin.tok));
+        ASSERT_TRUE(list.Contains(key));
       }
     }
   }
@@ -309,25 +331,92 @@ TEST_F(OffsetSkipTest, ConcurrentInsert) {
   ASSERT_EQ(list.num_nodes(), static_cast<uint64_t>(T) * N);
 }
 
+TEST_F(OffsetSkipTest, ConcurrentSeekForPrevDuringInsert) {
+  TestComparator cmp;
+  TestOffsetSkipList list(cmp, kTestMemCap);
+  const int N = 800;
+  const int T = 4;
+  std::atomic<int> next{0};
+  std::atomic<bool> done{false};
+  std::vector<std::thread> readers;
+  readers.reserve(3);
+  for (int r = 0; r < 3; r++) {
+    readers.emplace_back([&list, &next, &done]() {
+      TestOffsetSkipList::Iterator iter(&list);
+      while (!done.load(std::memory_order_relaxed)) {
+        int hi = next.load(std::memory_order_acquire);
+        if (hi <= 0) {
+          continue;
+        }
+        Key targets[] = {0, static_cast<Key>(hi / 2),
+                         static_cast<Key>(hi - 1), static_cast<Key>(hi + 50)};
+        for (Key target : targets) {
+          iter.SeekForPrev(target);
+          if (iter.Valid()) {
+            ASSERT_LE(Decode(iter.key()), target);
+          }
+        }
+      }
+    });
+  }
+  std::vector<std::thread> writers;
+  writers.reserve(T);
+  for (int t = 0; t < T; t++) {
+    writers.emplace_back([&list, &next, N, T, t]() {
+      auto* tok = EnsureAcquired(&list);
+      for (int i = 0; i < N; i++) {
+        Key key = static_cast<Key>(t) + static_cast<Key>(i) * T;
+        auto* tc = list.tls_get();
+        char* buf = list.AllocateKey(sizeof(Key), tc);
+        ASSERT_NE(buf, nullptr);
+        memcpy(buf, &key, sizeof(Key));
+        ASSERT_EQ(list.InsertConcurrently(buf, tc), nullptr);
+        next.fetch_add(1, std::memory_order_release);
+        TestOffsetSkipList::Iterator iter(&list);
+        iter.SeekForPrev(key);
+        ASSERT_TRUE(iter.Valid());
+        ASSERT_EQ(Decode(iter.key()), key);
+      }
+      tok->idle();
+    });
+  }
+  for (auto& th : writers) {
+    th.join();
+  }
+  done.store(true, std::memory_order_relaxed);
+  for (auto& th : readers) {
+    th.join();
+  }
+  TestOffsetSkipList::Iterator iter(&list);
+  for (int i = 0; i < T * N; i++) {
+    Key key = static_cast<Key>(i);
+    iter.SeekForPrev(key);
+    ASSERT_TRUE(iter.Valid());
+    ASSERT_EQ(Decode(iter.key()), key);
+  }
+  list.TEST_Validate();
+}
+
 TEST_F(OffsetSkipTest, InsertDuplicateFreesUnused) {
   TestComparator cmp;
   TestOffsetSkipList list(cmp, kTestMemCap);
   Key key = 42;
-  char* first = list.AllocateKey(sizeof(Key));
+  auto* tc = list.tls_get();
+  char* first = list.AllocateKey(sizeof(Key), tc);
   ASSERT_NE(first, nullptr);
   memcpy(first, &key, sizeof(Key));
-  auto* tok = EnsureAcquired(&list);
-  ASSERT_EQ(list.Insert(first, tok), nullptr);
+  EnsureAcquired(&list);
+  ASSERT_EQ(list.Insert(first, tc), nullptr);
   const size_t after_first = list.mem_size();
-  char* dup = list.AllocateKey(sizeof(Key));
+  char* dup = list.AllocateKey(sizeof(Key), tc);
   ASSERT_NE(dup, nullptr);
   memcpy(dup, &key, sizeof(Key));
-  ASSERT_EQ(list.Insert(dup, tok), first);
-  list.FreeUnusedKey(dup, sizeof(Key));
+  ASSERT_EQ(list.Insert(dup, tc), first);
+  list.FreeUnusedKey(dup, sizeof(Key), tc);
   ASSERT_LE(list.mem_size(), after_first);
   {
     ScopedPin pin(&list);
-    ASSERT_TRUE(list.Contains(key, pin.tok));
+    ASSERT_TRUE(list.Contains(key));
   }
   list.set_readonly();
   ASSERT_EQ(list.num_nodes(), 1U);
@@ -441,26 +530,28 @@ TEST_F(OffsetSkipTest, DupInsertKeepsValueLeading) {
   TestComparator cmp;
   TestOffsetSkipList list(cmp, kTestMemCap);
   Key key = 7;
-  char* first = list.AllocateKey(sizeof(Key));
+  auto* tc = list.tls_get();
+  char* first = list.AllocateKey(sizeof(Key), tc);
   ASSERT_NE(first, nullptr);
   memcpy(first, &key, sizeof(Key));
-  auto* tok = EnsureAcquired(&list);
-  ASSERT_EQ(list.Insert(first, tok), nullptr);
+  EnsureAcquired(&list);
+  ASSERT_EQ(list.Insert(first, tc), nullptr);
 
   constexpr size_t kLeading = 8;
-  char* dup = list.AllocateKey(sizeof(Key), kLeading);
+  char* dup = list.AllocateKey(sizeof(Key), tc, kLeading);
   ASSERT_NE(dup, nullptr);
   memcpy(dup, &key, sizeof(Key));
   const size_t vpos = list.KeyAllocPos(dup, kLeading);
   memset(const_cast<terark::byte_t*>(list.mem_data()) + vpos, 0xAB, kLeading);
-  ASSERT_EQ(list.Insert(dup, tok), first);
-  ASSERT_EQ(list.FreeUnusedKeyKeepLeading(dup, sizeof(Key), kLeading), vpos);
+  ASSERT_EQ(list.Insert(dup, tc), first);
+  ASSERT_EQ(list.FreeUnusedKeyKeepLeading(dup, sizeof(Key), kLeading, tc),
+            vpos);
   for (size_t i = 0; i < kLeading; ++i) {
     ASSERT_EQ(list.mem_data()[vpos + i], 0xAB);
   }
   {
     ScopedPin pin(&list);
-    ASSERT_TRUE(list.Contains(key, pin.tok));
+    ASSERT_TRUE(list.Contains(key));
   }
   list.TEST_Validate();
 }
@@ -469,39 +560,49 @@ TEST_F(OffsetSkipTest, InsertWithHint_Reverse) {
   const int N = 4000;
   TestComparator cmp;
   TestOffsetSkipList list(cmp, kTestMemCap);
-  auto* tok = EnsureAcquired(&list);
+  EnsureAcquired(&list);
   for (int i = N - 1; i >= 0; --i) {
-    ASSERT_TRUE(InsertWithHint(&list, static_cast<Key>(i), tok));
+    ASSERT_TRUE(InsertWithHint(&list, static_cast<Key>(i)));
   }
+  list.FinishHint(list.tls_get());
   Validate(&list);
 }
 
 TEST_F(OffsetSkipTest, InsertWithHint_MultipleHints) {
-  const int N = 3000;
+  const int N = 250;
   const int S = 12;
-  Random rnd(534);
   TestComparator cmp;
   TestOffsetSkipList list(cmp, kTestMemCap);
-  TestOffsetSkipList::Token* tokens[S];
-  Key last_key[S];
-  for (int i = 0; i < S; ++i) {
-    tokens[i] = new TestOffsetSkipList::Token();
-    EnsureAcquired(&list, tokens[i]);
-    last_key[i] = 0;
+  std::vector<std::thread> threads;
+  threads.reserve(S);
+  for (int s = 0; s < S; ++s) {
+    threads.emplace_back([&list, s]() {
+      auto* tc = list.tls_get();
+      auto* tok = EnsureAcquired(&list);
+      for (int i = 1; i <= N; ++i) {
+        Key key = (static_cast<Key>(s) << 32) + static_cast<Key>(i);
+        char* buf = list.AllocateKey(sizeof(Key), tc);
+        ASSERT_NE(buf, nullptr);
+        memcpy(buf, &key, sizeof(Key));
+        ASSERT_EQ(list.InsertWithHintConcurrently(buf, tc), nullptr);
+      }
+      list.FinishHint(tc);
+      tok->idle();
+    });
   }
-  for (int i = 0; i < N; ++i) {
-    int s = static_cast<int>(rnd.Uniform(S));
-    Key key = (static_cast<Key>(s) << 32) + (++last_key[s]);
-    ASSERT_TRUE(InsertWithHint(&list, key, tokens[s]));
+  for (auto& th : threads) {
+    th.join();
   }
-  Validate(&list);
-  for (int i = 0; i < S; ++i) {
-    if (tokens[i]->state() == TestOffsetSkipList::AcquireDone ||
-        tokens[i]->state() == TestOffsetSkipList::AcquireIdle) {
-      tokens[i]->release();
+  {
+    ScopedPin pin(&list);
+    for (int s = 0; s < S; ++s) {
+      for (int i = 1; i <= N; ++i) {
+        Key key = (static_cast<Key>(s) << 32) + static_cast<Key>(i);
+        ASSERT_TRUE(list.Contains(key));
+      }
     }
-    tokens[i]->dispose();
   }
+  list.TEST_Validate();
 }
 
 TEST_F(OffsetSkipTest, ConcurrentInsertWithHint) {
@@ -513,14 +614,16 @@ TEST_F(OffsetSkipTest, ConcurrentInsertWithHint) {
   threads.reserve(T);
   for (int t = 0; t < T; ++t) {
     threads.emplace_back([&list, t]() {
+      auto* tc = list.tls_get();
       auto* tok = EnsureAcquired(&list);
       for (int i = 0; i < N; ++i) {
         Key key = static_cast<Key>(t) * N + i;
-        char* buf = list.AllocateKey(sizeof(Key));
+        char* buf = list.AllocateKey(sizeof(Key), tc);
         ASSERT_NE(buf, nullptr);
         memcpy(buf, &key, sizeof(Key));
-        ASSERT_EQ(list.InsertWithHintConcurrently(buf, tok), nullptr);
+        ASSERT_EQ(list.InsertWithHintConcurrently(buf, tc), nullptr);
       }
+      list.FinishHint(tc);
       tok->idle();
     });
   }
@@ -532,7 +635,7 @@ TEST_F(OffsetSkipTest, ConcurrentInsertWithHint) {
     for (int t = 0; t < T; ++t) {
       for (int i = 0; i < N; ++i) {
         Key key = static_cast<Key>(t) * N + i;
-        ASSERT_TRUE(list.Contains(key, pin.tok));
+        ASSERT_TRUE(list.Contains(key));
       }
     }
   }
@@ -542,52 +645,57 @@ TEST_F(OffsetSkipTest, ConcurrentInsertWithHint) {
 TEST_F(OffsetSkipTest, InsertWithHintAllocatesAndFinishHint) {
   TestComparator cmp;
   TestOffsetSkipList list(cmp, kTestMemCap);
-  auto* tok = EnsureAcquired(&list);
-  ASSERT_EQ(tok->m_splice_hint, nullptr);
+  EnsureAcquired(&list);
+  ASSERT_EQ(list.tls_get()->peek_splice(), nullptr);
 
   Key k1 = 10, k2 = 20, k3 = 30;
-  char* n1 = list.AllocateKey(sizeof(Key));
-  char* n2 = list.AllocateKey(sizeof(Key));
-  char* n3 = list.AllocateKey(sizeof(Key));
+  auto* tc = list.tls_get();
+  char* n1 = list.AllocateKey(sizeof(Key), tc);
+  char* n2 = list.AllocateKey(sizeof(Key), tc);
+  char* n3 = list.AllocateKey(sizeof(Key), tc);
   ASSERT_NE(n1, nullptr);
   ASSERT_NE(n2, nullptr);
   ASSERT_NE(n3, nullptr);
   memcpy(n1, &k1, sizeof(Key));
   memcpy(n2, &k2, sizeof(Key));
   memcpy(n3, &k3, sizeof(Key));
-  ASSERT_EQ(list.InsertWithHint(n1, tok), nullptr);
-  ASSERT_NE(tok->m_splice_hint, nullptr);
-  auto* first = tok->m_splice_hint;
-  ASSERT_EQ(list.InsertWithHint(n2, tok), nullptr);
-  ASSERT_EQ(tok->m_splice_hint, first);
+  ASSERT_EQ(list.InsertWithHint(n1, tc), nullptr);
+  ASSERT_NE(tc->peek_splice(), nullptr);
+  auto* first = tc->peek_splice();
+  ASSERT_EQ(list.InsertWithHint(n2, tc), nullptr);
+  ASSERT_EQ(tc->peek_splice(), first);
 
-  list.FinishHint(tok);
-  ASSERT_EQ(tok->m_splice_hint, first);
-  ASSERT_EQ(tok->m_splice_hint->height, 0);
-  ASSERT_EQ(list.InsertWithHint(n3, tok), nullptr);
-  ASSERT_EQ(tok->m_splice_hint, first);
-  list.FinishHint(tok);
-  ASSERT_EQ(tok->m_splice_hint, first);
-  ASSERT_EQ(tok->m_splice_hint->height, 0);
+  list.FinishHint(tc);
+  ASSERT_EQ(tc->peek_splice(), first);
+  ASSERT_EQ(tc->peek_splice()->height, 0);
+  ASSERT_EQ(list.InsertWithHint(n3, tc), nullptr);
+  ASSERT_EQ(tc->peek_splice(), first);
+  list.FinishHint(tc);
+  ASSERT_EQ(tc->peek_splice(), first);
+  ASSERT_EQ(tc->peek_splice()->height, 0);
   {
     ScopedPin pin(&list);
-    ASSERT_TRUE(list.Contains(k1, pin.tok));
-    ASSERT_TRUE(list.Contains(k2, pin.tok));
-    ASSERT_TRUE(list.Contains(k3, pin.tok));
+    ASSERT_TRUE(list.Contains(k1));
+    ASSERT_TRUE(list.Contains(k2));
+    ASSERT_TRUE(list.Contains(k3));
   }
   list.TEST_Validate();
 }
 
 static char* AllocHeight1(TestOffsetSkipList* list, Key v) {
-  char* buf = list->TEST_AllocateKeyWithHeight(sizeof(Key), 1);
+  char* buf = list->TEST_AllocateKeyWithHeight(sizeof(Key), 1, list->tls_get());
   EXPECT_NE(buf, nullptr);
   memcpy(buf, &v, sizeof(Key));
   return buf;
 }
 
 static void InsertHeight1(TestOffsetSkipList* list, Key v) {
-  char* buf = AllocHeight1(list, v);
-  ASSERT_EQ(list->Insert(buf, EnsureAcquired(list)), nullptr);
+  auto* tc = list->tls_get();
+  char* buf = list->TEST_AllocateKeyWithHeight(sizeof(Key), 1, tc);
+  EXPECT_NE(buf, nullptr);
+  memcpy(buf, &v, sizeof(Key));
+  EnsureAcquired(list);
+  ASSERT_EQ(list->Insert(buf, tc), nullptr);
 }
 
 static std::vector<Key> CollectOrder(TestOffsetSkipList* list) {
@@ -610,14 +718,16 @@ TEST_F(OffsetSkipTest, StaleSplicePrevGreaterThanKey) {
     InsertHeight1(&old_list, 10);
     InsertHeight1(&old_list, 20);
     char* k30 = AllocHeight1(&old_list, 30);
-    ASSERT_EQ(old_list.Insert(k30, EnsureAcquired(&old_list)), nullptr);
+    EnsureAcquired(&old_list);
+    ASSERT_EQ(old_list.Insert(k30, old_list.tls_get()), nullptr);
     char* k15 = AllocHeight1(&old_list, 15);
-    auto* tok = EnsureAcquired(&old_list);
-    old_list.TEST_AllocHint(tok);
-    auto* splice = tok->m_splice_hint;
+    EnsureAcquired(&old_list);
+    auto* splice = old_list.TEST_AllocHint();
     splice->prev[0] = old_list.TEST_LocOf(k30);
     splice->next[0] = TestOffsetSkipList::nil;
-    ASSERT_EQ(old_list.TEST_InsertSkipPrepareLegacy(k15, splice, tok), nullptr);
+    ASSERT_EQ(old_list.TEST_InsertSkipPrepareLegacy(k15, splice,
+                                                   old_list.tls_get()),
+              nullptr);
     ASSERT_EQ(CollectOrder(&old_list), (std::vector<Key>{10, 20, 30, 15}));
   }
   {
@@ -625,18 +735,18 @@ TEST_F(OffsetSkipTest, StaleSplicePrevGreaterThanKey) {
     InsertHeight1(&list, 10);
     InsertHeight1(&list, 20);
     char* k30 = AllocHeight1(&list, 30);
-    ASSERT_EQ(list.Insert(k30, EnsureAcquired(&list)), nullptr);
+    EnsureAcquired(&list);
+    ASSERT_EQ(list.Insert(k30, list.tls_get()), nullptr);
     char* k15 = AllocHeight1(&list, 15);
-    auto* tok = list.tls_token();
-    list.TEST_AllocHint(tok);
-    auto* splice = tok->m_splice_hint;
+    auto* splice = list.TEST_AllocHint();
     splice->prev[0] = list.TEST_LocOf(k30);
     splice->next[0] = TestOffsetSkipList::nil;
-    ASSERT_EQ(list.TEST_InsertSkipPrepare(k15, splice, tok), nullptr);
+    ASSERT_EQ(list.TEST_InsertSkipPrepare(k15, splice, list.tls_get()),
+              nullptr);
     Key v15 = 15;
     {
       ScopedPin pin(&list);
-      ASSERT_TRUE(list.Contains(v15, pin.tok));
+      ASSERT_TRUE(list.Contains(v15));
     }
     ASSERT_EQ(CollectOrder(&list), (std::vector<Key>{10, 15, 20, 30}));
     list.TEST_Validate();
@@ -650,36 +760,38 @@ TEST_F(OffsetSkipTest, StaleSpliceNextLessThanKey) {
     TestOffsetSkipList old_list(cmp, kTestMemCap);
     char* k10 = AllocHeight1(&old_list, 10);
     char* k20 = AllocHeight1(&old_list, 20);
-    ASSERT_EQ(old_list.Insert(k10, EnsureAcquired(&old_list)), nullptr);
-    ASSERT_EQ(old_list.Insert(k20, EnsureAcquired(&old_list)), nullptr);
+    EnsureAcquired(&old_list);
+    ASSERT_EQ(old_list.Insert(k10, old_list.tls_get()), nullptr);
+    ASSERT_EQ(old_list.Insert(k20, old_list.tls_get()), nullptr);
     InsertHeight1(&old_list, 30);
     char* k25 = AllocHeight1(&old_list, 25);
-    auto* tok = EnsureAcquired(&old_list);
-    old_list.TEST_AllocHint(tok);
-    auto* splice = tok->m_splice_hint;
+    EnsureAcquired(&old_list);
+    auto* splice = old_list.TEST_AllocHint();
     splice->prev[0] = old_list.TEST_LocOf(k10);
     splice->next[0] = old_list.TEST_LocOf(k20);
-    ASSERT_EQ(old_list.TEST_InsertSkipPrepareLegacy(k25, splice, tok), nullptr);
+    ASSERT_EQ(old_list.TEST_InsertSkipPrepareLegacy(k25, splice,
+                                                   old_list.tls_get()),
+              nullptr);
     ASSERT_EQ(CollectOrder(&old_list), (std::vector<Key>{10, 25, 20, 30}));
   }
   {
     TestOffsetSkipList list(cmp, kTestMemCap);
     char* k10 = AllocHeight1(&list, 10);
     char* k20 = AllocHeight1(&list, 20);
-    ASSERT_EQ(list.Insert(k10, EnsureAcquired(&list)), nullptr);
-    ASSERT_EQ(list.Insert(k20, EnsureAcquired(&list)), nullptr);
+    EnsureAcquired(&list);
+    ASSERT_EQ(list.Insert(k10, list.tls_get()), nullptr);
+    ASSERT_EQ(list.Insert(k20, list.tls_get()), nullptr);
     InsertHeight1(&list, 30);
     char* k25 = AllocHeight1(&list, 25);
-    auto* tok = list.tls_token();
-    list.TEST_AllocHint(tok);
-    auto* splice = tok->m_splice_hint;
+    auto* splice = list.TEST_AllocHint();
     splice->prev[0] = list.TEST_LocOf(k10);
     splice->next[0] = list.TEST_LocOf(k20);
-    ASSERT_EQ(list.TEST_InsertSkipPrepare(k25, splice, tok), nullptr);
+    ASSERT_EQ(list.TEST_InsertSkipPrepare(k25, splice, list.tls_get()),
+              nullptr);
     Key v25 = 25;
     {
       ScopedPin pin(&list);
-      ASSERT_TRUE(list.Contains(v25, pin.tok));
+      ASSERT_TRUE(list.Contains(v25));
     }
     ASSERT_EQ(CollectOrder(&list), (std::vector<Key>{10, 20, 25, 30}));
     list.TEST_Validate();
@@ -694,7 +806,8 @@ TEST_F(OffsetSkipTest, StaleAfterHintDoesNotStopEarly) {
   const Key vals[] = {10, 20, 30, 40};
   for (int i = 0; i < 4; ++i) {
     nodes[i] = AllocHeight1(&list, vals[i]);
-    ASSERT_EQ(list.Insert(nodes[i], EnsureAcquired(&list)), nullptr);
+    EnsureAcquired(&list);
+    ASSERT_EQ(list.Insert(nodes[i], list.tls_get()), nullptr);
   }
   Key target = 35;
   TestOffsetSkipList::link_t old_prev = 0, old_next = 0;
@@ -719,14 +832,16 @@ TEST_F(OffsetSkipTest, StaleSplicePrevIsDuplicate) {
   {
     TestOffsetSkipList old_list(cmp, kTestMemCap);
     char* first = AllocHeight1(&old_list, 10);
-    ASSERT_EQ(old_list.Insert(first, EnsureAcquired(&old_list)), nullptr);
+    EnsureAcquired(&old_list);
+    ASSERT_EQ(old_list.Insert(first, old_list.tls_get()), nullptr);
     char* dup = AllocHeight1(&old_list, 10);
-    auto* tok = EnsureAcquired(&old_list);
-    old_list.TEST_AllocHint(tok);
-    auto* splice = tok->m_splice_hint;
+    EnsureAcquired(&old_list);
+    auto* splice = old_list.TEST_AllocHint();
     splice->prev[0] = old_list.TEST_LocOf(first);
     splice->next[0] = TestOffsetSkipList::nil;
-    ASSERT_EQ(old_list.TEST_InsertSkipPrepareLegacy(dup, splice, tok), nullptr);
+    ASSERT_EQ(old_list.TEST_InsertSkipPrepareLegacy(dup, splice,
+                                                   old_list.tls_get()),
+              nullptr);
     old_list.set_readonly();
     ASSERT_EQ(old_list.num_nodes(), 2U);
     ASSERT_EQ(CollectOrder(&old_list), (std::vector<Key>{10, 10}));
@@ -734,15 +849,14 @@ TEST_F(OffsetSkipTest, StaleSplicePrevIsDuplicate) {
   {
     TestOffsetSkipList list(cmp, kTestMemCap);
     char* first = AllocHeight1(&list, 10);
-    ASSERT_EQ(list.Insert(first, EnsureAcquired(&list)), nullptr);
+    EnsureAcquired(&list);
+    ASSERT_EQ(list.Insert(first, list.tls_get()), nullptr);
     char* dup = AllocHeight1(&list, 10);
-    auto* tok = list.tls_token();
-    list.TEST_AllocHint(tok);
-    auto* splice = tok->m_splice_hint;
+    auto* splice = list.TEST_AllocHint();
     splice->prev[0] = list.TEST_LocOf(first);
     splice->next[0] = TestOffsetSkipList::nil;
-    ASSERT_EQ(list.TEST_InsertSkipPrepare(dup, splice, tok), first);
-    list.FreeUnusedKey(dup, sizeof(Key));
+    ASSERT_EQ(list.TEST_InsertSkipPrepare(dup, splice, list.tls_get()), first);
+    list.FreeUnusedKey(dup, sizeof(Key), list.tls_get());
     list.set_readonly();
     ASSERT_EQ(list.num_nodes(), 1U);
     ASSERT_EQ(CollectOrder(&list), (std::vector<Key>{10}));
@@ -771,13 +885,14 @@ TEST_F(OffsetSkipTest, ConcurrentDuplicateFreesUnused) {
       }
       tok->acquire(&list);
       for (Key key : order) {
-        char* buf = list.AllocateKey(sizeof(Key));
+        auto* tc = list.tls_get();
+        char* buf = list.AllocateKey(sizeof(Key), tc);
         ASSERT_NE(buf, nullptr);
         memcpy(buf, &key, sizeof(Key));
-        if (list.InsertConcurrently(buf, tok) == nullptr) {
+        if (list.InsertConcurrently(buf, tc) == nullptr) {
           wins.fetch_add(1, std::memory_order_relaxed);
         } else {
-          list.FreeUnusedKey(buf, sizeof(Key));
+          list.FreeUnusedKey(buf, sizeof(Key), tc);
         }
       }
       tok->idle();
@@ -791,18 +906,19 @@ TEST_F(OffsetSkipTest, ConcurrentDuplicateFreesUnused) {
     ScopedPin pin(&list);
     for (int i = 0; i < M; ++i) {
       Key key = static_cast<Key>(i);
-      ASSERT_TRUE(list.Contains(key, pin.tok));
+      ASSERT_TRUE(list.Contains(key));
     }
   }
   list.TEST_Validate();
-  auto* tok = EnsureAcquired(&list);
+  EnsureAcquired(&list);
   for (int i = 0; i < 32; ++i) {
     Key key = static_cast<Key>(M + i);
-    char* buf = list.AllocateKey(sizeof(Key));
+    auto* tc = list.tls_get();
+    char* buf = list.AllocateKey(sizeof(Key), tc);
     ASSERT_NE(buf, nullptr);
     memcpy(buf, &key, sizeof(Key));
-    ASSERT_EQ(list.Insert(buf, tok), nullptr);
-    ASSERT_TRUE(list.Contains(key, tok));
+    ASSERT_EQ(list.Insert(buf, tc), nullptr);
+    ASSERT_TRUE(list.Contains(key));
   }
   list.TEST_Validate();
 }
@@ -822,6 +938,14 @@ TEST_F(OffsetSkipTest, SeekMissingEstimateCountRandomSeek) {
   iter.SeekForPrev(t);
   ASSERT_TRUE(iter.Valid());
   ASSERT_EQ(Decode(iter.key()), 20U);
+  t = 30;
+  iter.SeekForPrev(t);
+  ASSERT_TRUE(iter.Valid());
+  ASSERT_EQ(Decode(iter.key()), 30U);
+  t = 10;
+  iter.SeekForPrev(t);
+  ASSERT_TRUE(iter.Valid());
+  ASSERT_EQ(Decode(iter.key()), 10U);
   t = 5;
   iter.Seek(t);
   ASSERT_TRUE(iter.Valid());
@@ -838,10 +962,10 @@ TEST_F(OffsetSkipTest, SeekMissingEstimateCountRandomSeek) {
   Key lo = 10;
   Key mid = 30;
   Key hi = 51;
-  ASSERT_LE(list.EstimateCount(lo, &iter),
-            list.EstimateCount(mid, &iter));
-  ASSERT_LE(list.EstimateCount(mid, &iter),
-            list.EstimateCount(hi, &iter));
+  ASSERT_LE(list.EstimateCount(lo),
+            list.EstimateCount(mid));
+  ASSERT_LE(list.EstimateCount(mid),
+            list.EstimateCount(hi));
 
   std::set<Key> present(std::begin(keys), std::end(keys));
   for (int i = 0; i < 16; ++i) {
@@ -870,13 +994,13 @@ TEST_F(OffsetSkipTest, TokenReadonlySkipsQueue) {
   ASSERT_EQ(list.token_qlen(), 0U);
   ASSERT_EQ(tok->state(), TestOffsetSkipList::AcquireDone);
   Key k10 = 10;
-  ASSERT_TRUE(list.Contains(k10, tok));
-  ASSERT_NE(list.Get(k10, tok), nullptr);
+  ASSERT_TRUE(list.Contains(k10));
+  ASSERT_NE(list.Get(k10), nullptr);
   tok->release();
   ASSERT_EQ(list.token_qlen(), 0U);
   ASSERT_EQ(tok->state(), TestOffsetSkipList::ReleaseDone);
   {
-    TestOffsetSkipList::ReadonlyIterator iter(&list);
+    TestOffsetSkipList::NoPinIterator iter(&list);
     ASSERT_EQ(list.token_qlen(), 0U);
     iter.SeekToFirst();
     ASSERT_TRUE(iter.Valid());
@@ -908,12 +1032,12 @@ TEST_F(OffsetSkipTest, AttachReadonlySeesKeys) {
                                 TestOffsetSkipList::Iterator>::value,
                 "");
   static_assert(!std::is_base_of<TestOffsetSkipList::Token,
-                                 TestOffsetSkipList::ReadonlyIterator>::value,
+                                 TestOffsetSkipList::NoPinIterator>::value,
                 "");
-  ASSERT_LT(sizeof(TestOffsetSkipList::ReadonlyIterator),
+  ASSERT_LT(sizeof(TestOffsetSkipList::NoPinIterator),
             sizeof(TestOffsetSkipList::Iterator));
   ASSERT_EQ(attached.token_qlen(), 0U);
-  TestOffsetSkipList::ReadonlyIterator it(&attached);
+  TestOffsetSkipList::NoPinIterator it(&attached);
   ASSERT_EQ(attached.token_qlen(), 0U);
   it.SeekToFirst();
   ASSERT_TRUE(it.Valid());
@@ -1001,6 +1125,7 @@ TEST(OffsetSkipRepTest, Factory) {
   ASSERT_TRUE(fac->CanHandleDuplicatedKey());
   std::string opt = fac->GetPrintableOptions();
   ASSERT_NE(opt.find("token_use_idle"), std::string::npos);
+  ASSERT_NE(opt.find("enable_gc"), std::string::npos);
 }
 
 TEST(OffsetSkipRepTest, EasyNewGeneric) {
@@ -1020,6 +1145,85 @@ TEST(OffsetSkipRepTest, EasyNewGeneric) {
   } catch (const Status& s) {
     ASSERT_TRUE(s.IsNotFound());
   }
+}
+
+TEST(OffsetSkipRepTest, EnableGcOffInsertGetIterate) {
+  Options options;
+  options.allow_concurrent_memtable_write = true;
+  WriteBufferManager wb(options.db_write_buffer_size);
+  std::unique_ptr<MemTable> mem(NewOffsetMemTable(
+      &options, &wb, R"({"mem_cap":16777216,"enable_gc":false})"));
+  SequenceNumber seq = 1;
+  ASSERT_OK(mem->Add(seq++, kTypeValue, "a", "va", nullptr));
+  ASSERT_OK(mem->Add(seq++, kTypeValue, "b", "vb", nullptr));
+  for (int i = 0; i < 8; ++i) {
+    ASSERT_OK(mem->Add(seq++, kTypeValue, "a", "va" + std::to_string(i),
+                       nullptr));
+  }
+  std::string value;
+  ASSERT_TRUE(MemGet(mem.get(), "a", 100, &value));
+  ASSERT_EQ(value, "va7");
+  ASSERT_TRUE(MemGet(mem.get(), "b", 100, &value));
+  ASSERT_EQ(value, "vb");
+  Arena arena;
+  InternalIterator* it = mem->NewIterator(ReadOptions(), &arena);
+  it->SeekToFirst();
+  ASSERT_TRUE(it->Valid());
+  ASSERT_EQ(ExtractUserKey(it->key()).ToString(), "a");
+  it->Seek(InternalKey("b", 100, kTypeValue).Encode());
+  ASSERT_TRUE(it->Valid());
+  ASSERT_EQ(ExtractUserKey(it->key()).ToString(), "b");
+  it->Next();
+  ASSERT_FALSE(it->Valid());
+  // "b" was inserted at seq 2; SeekForPrev(seq=100) is before that
+  // internal key (seq descending). seq=1 is after it.
+  it->SeekForPrev(InternalKey("b", 1, kTypeValue).Encode());
+  ASSERT_TRUE(it->Valid());
+  ASSERT_EQ(ExtractUserKey(it->key()).ToString(), "b");
+  it->~InternalIterator();
+
+  void* hint = nullptr;
+  MemTablePostProcessInfo post;
+  ASSERT_OK(mem->Add(seq++, kTypeValue, "c", "vc", nullptr, true, &post, &hint));
+  ASSERT_OK(mem->Add(seq++, kTypeValue, "d", "vd", nullptr, true, &post, &hint));
+  ASSERT_NE(hint, nullptr);
+  void* first_hint = hint;
+  mem->FinishHint(hint);
+  hint = nullptr;
+  ASSERT_OK(mem->Add(seq++, kTypeValue, "e", "ve", nullptr, true, &post, &hint));
+  ASSERT_EQ(hint, first_hint);
+  mem->FinishHint(hint);
+  ASSERT_TRUE(MemGet(mem.get(), "c", 100, &value));
+  ASSERT_EQ(value, "vc");
+  ASSERT_TRUE(MemGet(mem.get(), "d", 100, &value));
+  ASSERT_EQ(value, "vd");
+  ASSERT_TRUE(MemGet(mem.get(), "e", 100, &value));
+  ASSERT_EQ(value, "ve");
+
+  std::atomic<bool> done{false};
+  std::vector<std::thread> readers;
+  readers.reserve(2);
+  for (int t = 0; t < 2; ++t) {
+    readers.emplace_back([&]() {
+      while (!done.load(std::memory_order_relaxed)) {
+        std::string v;
+        Status st;
+        if (MemGet(mem.get(), "a", 100000, &v, &st) && st.ok()) {
+          ASSERT_FALSE(v.empty());
+        }
+      }
+    });
+  }
+  for (int i = 0; i < 16; ++i) {
+    ASSERT_OK(mem->Add(seq++, kTypeValue, "a", "vx" + std::to_string(i),
+                       nullptr, true, &post));
+  }
+  done.store(true, std::memory_order_relaxed);
+  for (auto& th : readers) {
+    th.join();
+  }
+  ASSERT_TRUE(MemGet(mem.get(), "a", 100000, &value));
+  ASSERT_EQ(value, "vx15");
 }
 
 TEST(OffsetSkipRepTest, FactoryTokenOptsReleasePark) {
@@ -1094,45 +1298,25 @@ TEST(OffsetSkipRepTest, DuplicateSeq) {
 
 TEST(OffsetSkipRepTest, InsertWithHintAndLookahead) {
   Options options;
-  options.memtable_insert_with_hint_prefix_extractor.reset(
-      NewFixedPrefixTransform(3));
+  options.allow_concurrent_memtable_write = true;
   WriteBufferManager wb(options.db_write_buffer_size);
   std::unique_ptr<MemTable> mem(NewOffsetMemTable(
       &options, &wb, R"({"lookahead":8,"mem_cap":16777216})"));
   SequenceNumber seq = 1;
+  void* hint = nullptr;
+  MemTablePostProcessInfo post;
   for (int i = 0; i < 50; ++i) {
-    ASSERT_OK(
-        mem->Add(seq++, kTypeValue, "pre" + std::to_string(i), "v", nullptr));
+    ASSERT_OK(mem->Add(seq++, kTypeValue, "pre" + std::to_string(i), "v",
+                       nullptr, true, &post, &hint));
   }
+  mem->FinishHint(hint);
+  hint = nullptr;
   Arena arena;
   InternalIterator* it = mem->NewIterator(ReadOptions(), &arena);
   it->Seek(InternalKey("pre10", 100, kTypeValue).Encode());
   ASSERT_TRUE(it->Valid());
   ASSERT_EQ(ExtractUserKey(it->key()).ToString(), "pre10");
   it->~InternalIterator();
-}
-
-TEST(OffsetSkipRepTest, PrefixHintGetTwoPrefixesAndVersions) {
-  Options options;
-  options.memtable_insert_with_hint_prefix_extractor.reset(
-      NewFixedPrefixTransform(3));
-  WriteBufferManager wb(options.db_write_buffer_size);
-  std::unique_ptr<MemTable> mem(
-      NewOffsetMemTable(&options, &wb, R"({"mem_cap":16777216})"));
-  SequenceNumber seq = 1;
-  for (int i = 0; i < 8; ++i) {
-    ASSERT_OK(
-        mem->Add(seq++, kTypeValue, "aaa", "va" + std::to_string(i), nullptr));
-    ASSERT_OK(
-        mem->Add(seq++, kTypeValue, "bbb", "vb" + std::to_string(i), nullptr));
-  }
-  std::string value;
-  ASSERT_TRUE(MemGet(mem.get(), "aaa", 100, &value));
-  ASSERT_EQ(value, "va7");
-  ASSERT_TRUE(MemGet(mem.get(), "bbb", 100, &value));
-  ASSERT_EQ(value, "vb7");
-  ASSERT_TRUE(MemGet(mem.get(), "aaa", 2, &value));
-  ASSERT_EQ(value, "va0");
 }
 
 TEST(OffsetSkipRepTest, FinishHintParksWriterToken) {
@@ -1163,6 +1347,36 @@ TEST(OffsetSkipRepTest, FinishHintParksWriterToken) {
   ASSERT_EQ(value, "v2");
   ASSERT_TRUE(MemGet(mem.get(), "k3", 100, &value));
   ASSERT_EQ(value, "v3");
+}
+
+TEST(OffsetSkipRepTest, MixConcurrentAndNonConcurrentInsert) {
+  Options options;
+  options.allow_concurrent_memtable_write = true;
+  WriteBufferManager wb(options.db_write_buffer_size);
+  std::unique_ptr<MemTable> mem(
+      NewOffsetMemTable(&options, &wb, R"({"mem_cap":16777216})"));
+  void* hint = nullptr;
+  MemTablePostProcessInfo post;
+  ASSERT_OK(mem->Add(1, kTypeValue, "aaa0", "v1", nullptr));
+  ASSERT_OK(mem->Add(2, kTypeValue, "bbb0", "v2", nullptr, true, &post, &hint));
+  ASSERT_NE(hint, nullptr);
+  mem->FinishHint(hint);
+  hint = nullptr;
+  ASSERT_OK(mem->Add(3, kTypeValue, "aaa1", "v3", nullptr));
+  ASSERT_OK(mem->Add(4, kTypeValue, "ccc0", "v4", nullptr, true, &post));
+  ASSERT_OK(mem->Add(5, kTypeValue, "ddd0", "v5", nullptr, true, &post, &hint));
+  mem->FinishHint(hint);
+  std::string value;
+  ASSERT_TRUE(MemGet(mem.get(), "aaa0", 100, &value));
+  ASSERT_EQ(value, "v1");
+  ASSERT_TRUE(MemGet(mem.get(), "bbb0", 100, &value));
+  ASSERT_EQ(value, "v2");
+  ASSERT_TRUE(MemGet(mem.get(), "aaa1", 100, &value));
+  ASSERT_EQ(value, "v3");
+  ASSERT_TRUE(MemGet(mem.get(), "ccc0", 100, &value));
+  ASSERT_EQ(value, "v4");
+  ASSERT_TRUE(MemGet(mem.get(), "ddd0", 100, &value));
+  ASSERT_EQ(value, "v5");
 }
 
 TEST(OffsetSkipRepTest, ConcurrentHintPerThread) {
@@ -1465,8 +1679,6 @@ class LongerKeyFirstComparator : public Comparator {
 TEST(OffsetSkipRepTest, ReverseBytewiseOrder) {
   Options options;
   options.comparator = ReverseBytewiseComparator();
-  options.memtable_insert_with_hint_prefix_extractor.reset(
-      NewFixedPrefixTransform(1));
   WriteBufferManager wb(options.db_write_buffer_size);
   std::unique_ptr<MemTable> mem(NewOffsetMemTable(
       &options, &wb, R"({"lookahead":8,"mem_cap":16777216})"));
@@ -1595,6 +1807,64 @@ TEST(OffsetSkipRepTest, ConcurrentReadDuringWrite) {
   std::string value;
   ASSERT_TRUE(MemGet(mem.get(), "k", 100000, &value));
   ASSERT_EQ(value, "v64");
+}
+
+TEST(OffsetSkipRepTest, ConcurrentSeekForPrevDuringWrite) {
+  Options options;
+  options.allow_concurrent_memtable_write = true;
+  WriteBufferManager wb(options.db_write_buffer_size);
+  std::unique_ptr<MemTable> mem(
+      NewOffsetMemTable(&options, &wb, R"({"mem_cap":16777216})"));
+  const int N = 80;
+  const int T = 4;
+  std::atomic<int> next{0};
+  std::atomic<bool> done{false};
+  std::vector<std::thread> readers;
+  readers.reserve(3);
+  for (int r = 0; r < 3; r++) {
+    readers.emplace_back([&]() {
+      while (!done.load(std::memory_order_relaxed)) {
+        int hi = next.load(std::memory_order_acquire);
+        if (hi <= 0) {
+          continue;
+        }
+        Arena arena;
+        InternalIterator* it = mem->NewIterator(ReadOptions(), &arena);
+        std::string tkey = "k" + std::to_string(hi / 2);
+        it->SeekForPrev(InternalKey(tkey, 100000, kTypeValue).Encode());
+        if (it->Valid()) {
+          ASSERT_LE(ExtractUserKey(it->key()).ToString(), tkey);
+        }
+        it->~InternalIterator();
+      }
+    });
+  }
+  std::vector<std::thread> writers;
+  writers.reserve(T);
+  for (int t = 0; t < T; t++) {
+    writers.emplace_back([&, t]() {
+      MemTablePostProcessInfo post;
+      for (int i = 0; i < N; i++) {
+        int seq = t * N + i + 1;
+        std::string key = "k" + std::to_string(seq);
+        ASSERT_OK(mem->Add(seq, kTypeValue, key, "v", nullptr, true, &post));
+        next.fetch_add(1, std::memory_order_release);
+        Arena arena;
+        InternalIterator* it = mem->NewIterator(ReadOptions(), &arena);
+        it->SeekForPrev(InternalKey(key, seq, kTypeValue).Encode());
+        ASSERT_TRUE(it->Valid());
+        ASSERT_EQ(ExtractUserKey(it->key()).ToString(), key);
+        it->~InternalIterator();
+      }
+    });
+  }
+  for (auto& th : writers) {
+    th.join();
+  }
+  done.store(true, std::memory_order_relaxed);
+  for (auto& th : readers) {
+    th.join();
+  }
 }
 
 // Same user key, concurrent writers (seqs interleave). Readers check each

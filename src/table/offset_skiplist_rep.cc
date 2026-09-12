@@ -11,6 +11,25 @@
 // in place when cap allows; out-of-order or full cap COW a new array so
 // a published value array stays immutable (same as CSPP).
 //
+// InsertDup holds the per-ukey vec lock once (CSPP insert_for_dup_user_key).
+// In-order append does not GC. COW (grow or out-of-order) does GC+alloc
+// under that lock when enable_gc is true. Never memmove a published
+// array. MemRef values are allocated before the lock.
+//
+// enable_gc (default true): LazyFree + GC + TLS tokens. Get / Contains /
+// SST_Get pin a token while writable so COW LazyFree cannot revoke the
+// value array. After MarkReadOnly, GCAll has run — skip the token.
+// enable_gc=false: no LazyFree, no GC, no token; COW arrays stay until
+// the memtable is destroyed. Pin via need_pin() (m_flag == kFlagGc);
+// do not encode that as Token* == nullptr.
+// EstimateCount only walks skiplist nodes (published nodes are never
+// lazy-freed) and does not pin.
+// Hint is the writer TLS (not Token). FinishHint resets splice
+// height and parks the TLS writer token when gc is on. After
+// FinishHint the slot is dead: a new session must start with
+// *hint == nullptr (the caller clears it). It is not
+// memtable_insert_with_hint_prefix_extractor (unsupported).
+//
 // ConvertToSST / memtable_as_log_index follow CSPPMemTab: dump the mempool
 // as a custom SST (TopTable footer), and optionally store WAL refs instead
 // of values.
@@ -55,6 +74,7 @@
 #include <terark/fstring.hpp>
 #include <terark/num_to_str.hpp>
 #include <terark/offset_skiplist.hpp>
+#include <terark/sso.hpp>
 #include <terark/util/atomic.hpp>
 #include <terark/valvec.hpp>
 
@@ -175,21 +195,22 @@ class OffsetSkipListRep : public MemTableRep {
   virtual int sl_max_height() const = 0;
   virtual int sl_k_max_height() const = 0;
   virtual int sl_k_branching() const = 0;
-  virtual void FillMeta(OffsetSkipListMeta* m) const = 0;
   virtual Status SST_Get(const ReadOptions& ro, const ParsedInternalKey& pikey,
                          GetContext* get_context) const = 0;
   virtual bool GetRandomInternalKeysAppend(
       size_t num, std::vector<std::string>* output) const = 0;
   virtual uint64_t EstimateCountUkey(Slice ukey) const = 0;
   virtual uint64_t EstimateCountAll() const = 0;
-  virtual void FillTableProperties(TableProperties* p) const = 0;
   virtual void MemGC() = 0;
   virtual const std::string& sl_mmap_fpath() const = 0;
   virtual fstring sl_get_mmap() const = 0;
   virtual void sl_set_readonly() = 0;
+  virtual bool sl_is_gc_enabled() const = 0;
   virtual uint64_t sl_slow_exact_num_nodes() const = 0;
+  virtual size_t sl_mem_frag_size() const = 0;
   virtual void FlushAllWalTls() = 0;
   void BindFactoryTokenOpts();
+  virtual void ApplyFactoryGc(bool v) = 0;
 
  protected:
   OffsetSkipListRep(Allocator* allocator, const Comparator* ucmp,
@@ -264,6 +285,18 @@ class OffsetSkipListRep : public MemTableRep {
   static_assert(sizeof(KV_ToShortLogRef) == 16, "");
 #pragma pack(pop)
 
+  template <class Entry>
+  static size_t KeyPayloadSize(Slice ukey) {
+    return AlignUp4(4 + ukey.size()) + sizeof(Entry);
+  }
+  template <class Entry>
+  static size_t ValueLeadingSize(Slice val) {
+    if constexpr (std::is_same_v<Entry, KeyValueToMemRef>) {
+      return EncValueLen(val.size());
+    }
+    return 0;
+  }
+
   struct LogFileLookup {
     uint64_t fileno = 0;
     uint64_t cnt = 0;
@@ -313,7 +346,81 @@ class OffsetSkipListRep : public MemTableRep {
     return i;
   }
 
-  void MarkReadOnly() override { FlushAllWalTls(); }
+  void FillMeta(OffsetSkipListMeta* m) const {
+    memset(m, 0, sizeof(*m));
+    m->version = kMetaVersion;
+    m->log_ref = static_cast<uint32_t>(ref_to_wal_);
+    m->mem_used = sl_mem_size();
+    m->head_loc = sl_head_loc();
+    m->max_height = sl_max_height();
+    m->k_max_height = sl_k_max_height();
+    m->k_branching = sl_k_branching();
+    m->num_user_keys = sl_slow_exact_num_nodes();
+  }
+
+  void FillTableProperties(TableProperties* p) const {
+    const size_t num_entries = p->num_entries;
+    const size_t num_user_keys = sl_slow_exact_num_nodes();
+    p->tag_size = 8 * num_entries;
+    const size_t vec_hdr = sizeof(ValueVec) * num_user_keys;
+    if (ref_to_wal_ == OSLLogRefFormat::kPlainLogRef) {
+      p->data_size =
+          vec_hdr + (sizeof(KeyValueToLogRef) - sizeof(uint64_t)) * num_entries;
+    } else if (ref_to_wal_ == OSLLogRefFormat::kShortLogRef) {
+      p->data_size =
+          vec_hdr + (sizeof(KV_ToShortLogRef) - sizeof(uint64_t)) * num_entries;
+    } else {
+      p->data_size =
+          p->raw_value_size + vec_hdr +
+          (sizeof(KeyValueToMemRef) + 1 - sizeof(uint64_t)) * num_entries;
+    }
+    const size_t used = sl_mem_size() - sl_mem_frag_size();
+    const size_t rest = p->data_size + p->tag_size;
+    p->index_size = used > rest ? used - rest : 0;
+  }
+
+  size_t ApproximateMemoryUsage() override {
+    size_t walsize = 0;
+    for (size_t i = 0; i < num_wals_; ++i) {
+      walsize += wals_[i].bytes;
+    }
+    return sl_mem_size() + walsize;
+  }
+
+  uint64_t ApproximateNumEntries(const Slice& start_ikey,
+                                 const Slice& end_ikey) override {
+    uint64_t start_count = EstimateCountUkey(ExtractUserKey(start_ikey));
+    uint64_t end_count = EstimateCountUkey(ExtractUserKey(end_ikey));
+    return (end_count >= start_count) ? (end_count - start_count) : 0;
+  }
+
+  bool NeedsUserKeyCompareInGet() const override { return false; }
+
+  void Get(const ReadOptions& ro, const LookupKey& k, void* callback_args,
+           bool (*callback_func)(void* arg, const KeyValuePair&)) override {
+    ParsedInternalKey pik(k.internal_key());
+    GetPIK(ro, pik, callback_args, callback_func);
+  }
+
+  KeyHandle Allocate(const size_t, char**) override { TERARK_DIE("Bad call"); }
+  void Insert(KeyHandle) override { TERARK_DIE("Bad call"); }
+  bool InsertKey(KeyHandle) override { TERARK_DIE("Bad call"); }
+  void InsertWithHint(KeyHandle, void**) override { TERARK_DIE("Bad call"); }
+  bool InsertKeyWithHint(KeyHandle, void**) override { TERARK_DIE("Bad call"); }
+  void InsertWithHintConcurrently(KeyHandle, void**) override {
+    TERARK_DIE("Bad call");
+  }
+  bool InsertKeyWithHintConcurrently(KeyHandle, void**) override {
+    TERARK_DIE("Bad call");
+  }
+  void InsertConcurrently(KeyHandle) override { TERARK_DIE("Bad call"); }
+  bool InsertKeyConcurrently(KeyHandle) override { TERARK_DIE("Bad call"); }
+
+  void MarkReadOnly() override {
+    FlushAllWalTls();
+    MemGC();
+    sl_set_readonly();
+  }
 
   void InitSetMemTableAsLogIndex(bool b) final;
   bool SupportMemTableAsLogIndex() const final {
@@ -364,14 +471,20 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   void ParkToken(typename OffsetSL::Token* tok) const {
     token_use_idle_ ? tok->idle() : tok->release();
   }
+  // `hint` is the TLS from the caller's slot. Does not clear that
+  // void**. Next session must set *hint = nullptr first.
   void FinishHint(void* hint) override {
     if (hint == nullptr) {
       return;
     }
-    auto* tok = static_cast<Token*>(hint);
-    skip_list_.FinishHint(tok);
-    ParkToken(tok);
+    skip_list_.FinishHint(static_cast<typename OffsetSL::MemTls*>(hint));
+    if (skip_list_.is_gc_enabled()) {
+      auto* tls = static_cast<typename OffsetSL::MemTls*>(hint);
+      ParkToken(tls->template get_token<Token>());
+    }
   }
+
+  void ApplyFactoryGc(bool v) final { skip_list_.set_gc_enabled(v); }
 
   OffsetSkipListRepT(const Comparator* ucmp, Allocator* allocator,
                      const SliceTransform* transform, const size_t lookahead,
@@ -409,6 +522,9 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   }
   const byte_t* sl_mem_data() const final { return skip_list_.mem_data(); }
   size_t sl_mem_size() const final { return skip_list_.mem_size(); }
+  size_t sl_mem_frag_size() const final {
+    return skip_list_.mempool().frag_size();
+  }
   uint32_t sl_head_loc() const final { return skip_list_.head_loc(); }
   int sl_max_height() const final { return skip_list_.max_height(); }
   int sl_k_max_height() const final { return skip_list_.k_max_height(); }
@@ -418,6 +534,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   }
   fstring sl_get_mmap() const final { return skip_list_.get_mmap(); }
   void sl_set_readonly() final { skip_list_.set_readonly(); }
+  bool sl_is_gc_enabled() const final { return skip_list_.is_gc_enabled(); }
   uint64_t sl_slow_exact_num_nodes() const final {
     return skip_list_.slow_exact_num_nodes();
   }
@@ -440,6 +557,11 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   }
   template <class Entry>
   void AccountWal(Token* tok, size_t fidx, size_t valsize) {
+    if (tok == nullptr) {
+      as_atomic(wals_[fidx].cnt).fetch_add(1, std::memory_order_relaxed);
+      as_atomic(wals_[fidx].bytes).fetch_add(valsize, std::memory_order_relaxed);
+      return;
+    }
     auto& x = tok->wal_cnt_[fidx];
     x.cnt++;
     x.bytes += valsize;
@@ -453,12 +575,11 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     }
   }
 
-  void MarkReadOnly() override {
-    OffsetSkipListRep::MarkReadOnly();
-    skip_list_.GCAll();
-    skip_list_.set_readonly();
+  void MemGC() final {
+    if (skip_list_.is_gc_enabled()) {
+      skip_list_.GCAll();
+    }
   }
-  void MemGC() final { skip_list_.GCAll(); }
 
   template <class Entry>
   void AccountFirstInsert(Slice val, Token* tok) {
@@ -506,8 +627,10 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     }
   }
 
-  const char* FindNode(Slice ukey, typename OffsetSL::Token* tok) const {
-    auto found = skip_list_.FindGreaterOrEqual(ukey, tok);
+  // Search itself does not take a Token (the old Token* overload only
+  // forwarded). Callers that then read a value array pin when writable.
+  const char* FindNode(Slice ukey) const {
+    auto found = skip_list_.FindGreaterOrEqual(ukey);
     if (found.first != OffsetSL::nil && found.second == 0) {
       return skip_list_.KeyOf(found.first);
     }
@@ -532,23 +655,11 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   }
 
   template <class Entry>
-  static size_t KeyPayloadSize(Slice ukey) {
-    return AlignUp4(4 + ukey.size()) + sizeof(Entry);
-  }
-
-  template <class Entry>
-  static size_t ValueLeadingSize(Slice val) {
-    if constexpr (std::is_same_v<Entry, KeyValueToMemRef>) {
-      return EncValueLen(val.size());
-    }
-    return 0;
-  }
-
-  template <class Entry>
   char* AllocNewNode(Slice ukey, uint64_t tag, Slice val, Token* tok,
-                     size_t val_leading, size_t key_bytes) {
+                     typename OffsetSL::MemTls* tc, size_t val_leading,
+                     size_t key_bytes) {
     const size_t entry_off_in_key = key_bytes - sizeof(Entry);
-    char* p = skip_list_.AllocateKey(key_bytes, val_leading);
+    char* p = skip_list_.AllocateKey(key_bytes, tc, val_leading);
     TERARK_VERIFY_S(p != nullptr, "OffsetSkipList OOM: mem_cap=%zd",
                     skip_list_.mem_capacity());
     EncodeFixed32(p, uint32_t(ukey.size()));
@@ -566,18 +677,24 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     return p;
   }
 
+  // Same shape as CSPP insert_for_dup_user_key. The lock is per-ukey
+  // (vec->num), so same-key waiters are rare: do not unlock to GC/alloc
+  // then relock (wasted retry / thrown-away COW buffer, no hot-path win).
+  // In-order append is the hot path — write the slot and unlock, no GC.
+  // Grow or out-of-order: GC + alloc + memcpy under the lock. A published
+  // array is immutable (readers may hold it); never memmove it in place.
   template <class Entry>
   bool InsertDup(char* node_key, uint64_t tag, Slice val, Token* token,
-                 size_t reuse_vpos) {
-    skip_list_.GC(token);
+                 typename OffsetSL::MemTls* tc, size_t reuse_vpos) {
     auto* vec = NodeVec(node_key);
     const uint64_t curr_seq = tag >> 8;
     uint32_t vloc = 0;
+    // MemRef payload is independent of the vec lock; allocate before it.
     if constexpr (std::is_same_v<Entry, KeyValueToMemRef>) {
       if (reuse_vpos != size_t(-1)) {
         vloc = uint32_t(reuse_vpos / kAlign);
       } else if (val.size()) {
-        size_t vpos = skip_list_.mempool().alloc(EncValueLen(val.size()));
+        size_t vpos = skip_list_.tls_alloc(EncValueLen(val.size()), tc);
         TERARK_VERIFY_NE(vpos, size_t(-1));
         EncodePre(val, base() + vpos);
         vloc = uint32_t(vpos / kAlign);
@@ -594,156 +711,129 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     auto free_val = [&]() {
       if constexpr (std::is_same_v<Entry, KeyValueToMemRef>) {
         if (vloc) {
-          skip_list_.mempool().sfree(size_t(vloc) * kAlign,
-                                     EncValueLen(val.size()));
+          skip_list_.tls_sfree(size_t(vloc) * kAlign, EncValueLen(val.size()),
+                               tc);
         }
       }
     };
-    size_t cow_pos = size_t(-1);
-    uint32_t cow_cap = 0;
-    auto free_cow = [&]() {
-      if (cow_pos != size_t(-1)) {
-        skip_list_.mempool().sfree(cow_pos, sizeof(Entry) * cow_cap);
-        cow_pos = size_t(-1);
-        cow_cap = 0;
-      }
-    };
-    // Value / COW alloc stay outside the vec lock. Peek is only a size
-    // guess; dup / append / COW are decided again under the lock.
-    // Out-of-order never memmoves a published array (CSPP COW).
-    for (;;) {
-      const uint32_t snap_num = LoadUnlockedNum(vec);
-      TERARK_ASSERT_GT(snap_num, 0);
-      const uint32_t snap_cap = CapOf(snap_num);
-      auto* snap_old =
-          reinterpret_cast<Entry*>(base() + size_t(vec->pos) * kAlign);
-      const uint64_t snap_last = snap_old[snap_num - 1].tag >> 8;
-      const bool snap_append = snap_num < snap_cap && snap_last < curr_seq;
-      bool snap_dup = snap_last == curr_seq;
-      if (!snap_dup && snap_last > curr_seq) {
-        size_t idx = terark::lower_bound_0(snap_old, snap_num, curr_seq << 8);
-        snap_dup = snap_old[idx].tag >> 8 == curr_seq;
-      }
-      if (!snap_append && !snap_dup) {
-        const uint32_t want =
-            snap_num == snap_cap ? snap_cap * 2 : snap_cap;
-        if (cow_pos == size_t(-1) || cow_cap != want) {
-          free_cow();
-          cow_pos = skip_list_.mempool().alloc(sizeof(Entry) * want);
-          TERARK_VERIFY_NE(cow_pos, size_t(-1));
-          cow_cap = want;
-        }
-      }
-
-      uint32_t num;
-      while (kLockFlag & (num = as_atomic(vec->num).fetch_or(
-                              kLockFlag, std::memory_order_acquire))) {
-        std::this_thread::yield();
-      }
-      const uint32_t old_cap = CapOf(num);
-      TERARK_ASSERT_GT(num, 0);
-      TERARK_ASSERT_LE(num, old_cap);
-      auto* old = reinterpret_cast<Entry*>(base() + size_t(vec->pos) * kAlign);
-      const uint64_t last_seq = old[num - 1].tag >> 8;
-      if (UNLIKELY(curr_seq == last_seq)) {
+    uint32_t num;
+    while (kLockFlag & (num = as_atomic(vec->num).fetch_or(
+                            kLockFlag, std::memory_order_acquire))) {
+      std::this_thread::yield();
+    }
+    const uint32_t old_cap = CapOf(num);
+    TERARK_ASSERT_GT(num, 0);
+    TERARK_ASSERT_LE(num, old_cap);
+    auto* old = reinterpret_cast<Entry*>(base() + size_t(vec->pos) * kAlign);
+    const uint64_t last_seq = old[num - 1].tag >> 8;
+    if (UNLIKELY(curr_seq == last_seq)) {
+      as_atomic(vec->num).store(num, std::memory_order_release);
+      free_val();
+      return false;
+    }
+    if (num < old_cap && last_seq < curr_seq) {
+      write_entry(&old[num]);
+      as_atomic(vec->num).store(num + 1, std::memory_order_release);
+      return true;
+    }
+    // Cold: full or out-of-order. GC only here, still holding the lock.
+    if (token) {
+      skip_list_.GC(token);
+    }
+    const uint32_t want = num == old_cap ? old_cap * 2 : old_cap;
+    size_t cow_pos = skip_list_.tls_alloc(sizeof(Entry) * want, tc);
+    TERARK_VERIFY_NE(cow_pos, size_t(-1));
+    auto* neu = reinterpret_cast<Entry*>(base() + cow_pos);
+    if (LIKELY(last_seq < curr_seq)) {
+      memcpy(neu, old, sizeof(Entry) * num);
+      write_entry(&neu[num]);
+    } else {
+      // Out-of-order: splice into the copy, leave `old` untouched.
+      size_t idx = terark::lower_bound_0(old, num, curr_seq << 8);
+      if (UNLIKELY(old[idx].tag >> 8 == curr_seq)) {
         as_atomic(vec->num).store(num, std::memory_order_release);
-        free_cow();
+        skip_list_.tls_sfree(cow_pos, sizeof(Entry) * want, tc);
         free_val();
         return false;
       }
-      if (num < old_cap && last_seq < curr_seq) {
-        write_entry(&old[num]);
-        as_atomic(vec->num).store(num + 1, std::memory_order_release);
-        free_cow();
-        return true;
-      }
-      const uint32_t want = num == old_cap ? old_cap * 2 : old_cap;
-      if (cow_pos == size_t(-1) || cow_cap != want) {
-        as_atomic(vec->num).store(num, std::memory_order_release);
-        continue;
-      }
-      auto* neu = reinterpret_cast<Entry*>(base() + cow_pos);
-      if (LIKELY(last_seq < curr_seq)) {
-        memcpy(neu, old, sizeof(Entry) * num);
-        write_entry(&neu[num]);
-      } else {
-        size_t idx = terark::lower_bound_0(old, num, curr_seq << 8);
-        if (UNLIKELY(old[idx].tag >> 8 == curr_seq)) {
-          as_atomic(vec->num).store(num, std::memory_order_release);
-          free_cow();
-          free_val();
-          return false;
-        }
-        memcpy(neu, old, sizeof(Entry) * idx);
-        write_entry(&neu[idx]);
-        memcpy(neu + idx + 1, old + idx, sizeof(Entry) * (num - idx));
-      }
-      const size_t old_pos = size_t(vec->pos) * kAlign;
-      vec->pos = uint32_t(cow_pos / kAlign);
-      as_atomic(vec->num).store(num + 1, std::memory_order_release);
-      skip_list_.LazyFree(old_pos, sizeof(Entry) * old_cap, token);
-      return true;
+      memcpy(neu, old, sizeof(Entry) * idx);
+      write_entry(&neu[idx]);
+      memcpy(neu + idx + 1, old + idx, sizeof(Entry) * (num - idx));
     }
+    const size_t old_pos = size_t(vec->pos) * kAlign;
+    vec->pos = uint32_t(cow_pos / kAlign);
+    as_atomic(vec->num).store(num + 1, std::memory_order_release);
+    if (token) {
+      skip_list_.LazyFree(old_pos, sizeof(Entry) * old_cap, token);
+    }
+    return true;
   }
 
   template <class Entry, bool Concurrent>
   bool InsertKVTpl(uint64_t tag, const Slice& ukey, const Slice& val,
                    void** hint) {
-    auto* tok = skip_list_.template tls_token_nn<Token>();
-    bool need_acquire = true;
+    Token* tok = nullptr;
+    typename OffsetSL::MemTls* tc;
+    const bool gc = skip_list_.is_gc_enabled();
     if (hint != nullptr) {
-      auto*& slot = *reinterpret_cast<Token**>(hint);
-      if (LIKELY(slot != nullptr)) {
-        TERARK_ASSERT_EQ(slot, tok);
-        if constexpr (Concurrent) {
-          need_acquire = false;
+      auto*& slot = *reinterpret_cast<typename OffsetSL::MemTls**>(hint);
+      if (slot == nullptr) {
+        slot = skip_list_.tls_get();
+        tc = slot;
+        if (gc) {
+          tok = tc->template get_token<Token>();
+          tok->acquire(&skip_list_);
         }
       } else {
-        slot = tok;
+        tc = slot;
+        tc->assert_current_thread();
+        if (gc) {
+          tok = tc->template get_token<Token>();
+        }
       }
-    }
-    if (need_acquire) {
-      tok->acquire(&skip_list_);
+    } else {
+      tc = skip_list_.tls_get();
+      if (gc) {
+        tok = tc->template get_token<Token>();
+        tok->acquire(&skip_list_);
+      }
     }
     const size_t val_leading = ValueLeadingSize<Entry>(val);
     const size_t key_bytes = KeyPayloadSize<Entry>(ukey);
-    char* node = AllocNewNode<Entry>(ukey, tag, val, tok, val_leading, key_bytes);
-    const char* exist;
+    char* node = AllocNewNode<Entry>(ukey, tag, val, tok, tc, val_leading,
+                                     key_bytes);
+    char* exist;
     if (hint != nullptr) {
       if constexpr (Concurrent) {
-        exist = skip_list_.InsertWithHintConcurrently(node, tok);
+        exist = skip_list_.InsertWithHintConcurrently(node, tc);
       } else {
-        exist = skip_list_.InsertWithHint(node, tok);
+        exist = skip_list_.InsertWithHint(node, tc);
       }
     } else {
       if constexpr (Concurrent) {
-        exist = skip_list_.InsertConcurrently(node, tok);
+        exist = skip_list_.InsertConcurrently(node, tc);
       } else {
-        exist = skip_list_.Insert(node, tok);
+        exist = skip_list_.Insert(node, tc);
       }
     }
-    // Concurrent + hint: later inserts skip acquire. Otherwise park after.
-    // FinishHint resets height; ~Token deletes the splice.
-    const bool park = (hint == nullptr || !Concurrent);
     if (LIKELY(exist == nullptr)) {
       if constexpr (!std::is_same_v<Entry, KeyValueToMemRef>) {
         AccountFirstInsert<Entry>(val, tok);
       }
-      if (park) {
+      if (gc && hint == nullptr) {
         ParkToken(tok);
       }
       return true;
     }
     size_t reuse_vpos = size_t(-1);
     if (val_leading) {
-      reuse_vpos =
-          skip_list_.FreeUnusedKeyKeepLeading(node, key_bytes, val_leading);
+      reuse_vpos = skip_list_.FreeUnusedKeyKeepLeading(node, key_bytes,
+                                                       val_leading, tc);
     } else {
-      skip_list_.FreeUnusedKey(node, key_bytes);
+      skip_list_.FreeUnusedKey(node, key_bytes, tc);
     }
-    const bool dup_ok =
-        InsertDup<Entry>(const_cast<char*>(exist), tag, val, tok, reuse_vpos);
-    if (park) {
+    const bool dup_ok = InsertDup<Entry>(exist, tag, val, tok, tc, reuse_vpos);
+    if (gc && hint == nullptr) {
       ParkToken(tok);
     }
     return dup_ok;
@@ -760,32 +850,6 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     }
     return InsertKVTpl<KeyValueToMemRef, Concurrent>(tag, ukey, val, hint);
   }
-
-  void FillMeta(OffsetSkipListMeta* m) const final {
-    memset(m, 0, sizeof(*m));
-    m->version = kMetaVersion;
-    m->log_ref = static_cast<uint32_t>(ref_to_wal_);
-    m->mem_used = skip_list_.mem_size();
-    m->head_loc = skip_list_.head_loc();
-    m->max_height = skip_list_.max_height();
-    m->k_max_height = skip_list_.k_max_height();
-    m->k_branching = skip_list_.k_branching();
-    m->num_user_keys = skip_list_.slow_exact_num_nodes();
-  }
-
-  KeyHandle Allocate(const size_t, char**) override { TERARK_DIE("Bad call"); }
-  void Insert(KeyHandle) override { TERARK_DIE("Bad call"); }
-  bool InsertKey(KeyHandle) override { TERARK_DIE("Bad call"); }
-  void InsertWithHint(KeyHandle, void**) override { TERARK_DIE("Bad call"); }
-  bool InsertKeyWithHint(KeyHandle, void**) override { TERARK_DIE("Bad call"); }
-  void InsertWithHintConcurrently(KeyHandle, void**) override {
-    TERARK_DIE("Bad call");
-  }
-  bool InsertKeyWithHintConcurrently(KeyHandle, void**) override {
-    TERARK_DIE("Bad call");
-  }
-  void InsertConcurrently(KeyHandle) override { TERARK_DIE("Bad call"); }
-  bool InsertKeyConcurrently(KeyHandle) override { TERARK_DIE("Bad call"); }
 
   bool InsertKeyValue(uint64_t tag, const Slice& ukey,
                       const Slice& val) override {
@@ -808,11 +872,17 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   bool Contains(const Slice& internal_key) const override {
     Slice ukey = ExtractUserKey(internal_key);
     uint64_t find_tag = DecodeFixed64(ukey.end());
-    auto* tok = skip_list_.template tls_token_nn<Token>();
-    tok->acquire(const_cast<OffsetSL*>(&skip_list_));
-    const char* node = FindNode(ukey, tok);
+    const bool pin = skip_list_.need_pin();
+    Token* tok = nullptr;
+    if (pin) {
+      tok = skip_list_.template tls_token_nn<Token>();
+      tok->acquire(const_cast<OffsetSL*>(&skip_list_));
+    }
+    const char* node = FindNode(ukey);
     if (!node) {
-      ParkToken(tok);
+      if (pin) {
+        ParkToken(tok);
+      }
       return false;
     }
     auto* vec = NodeVec(node);
@@ -829,24 +899,10 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       ret = terark::binary_search_0(reinterpret_cast<KeyValueToMemRef*>(p), num,
                                     find_tag);
     }
-    ParkToken(tok);
-    return ret;
-  }
-
-  size_t ApproximateMemoryUsage() override {
-    size_t walsize = 0;
-    for (size_t i = 0; i < num_wals_; ++i) {
-      walsize += wals_[i].bytes;
+    if (pin) {
+      ParkToken(tok);
     }
-    return skip_list_.mem_size() + walsize;
-  }
-
-  bool NeedsUserKeyCompareInGet() const override { return false; }
-
-  void Get(const ReadOptions& ro, const LookupKey& k, void* callback_args,
-           bool (*callback_func)(void* arg, const KeyValuePair&)) override {
-    ParsedInternalKey pik(k.internal_key());
-    GetPIK(ro, pik, callback_args, callback_func);
+    return ret;
   }
 
   template <class Entry>
@@ -854,11 +910,17 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
                  void* callback_args,
                  bool (*callback_func)(void* arg, const KeyValuePair&)) {
     KeyValuePair key_val(k.user_key);
-    auto* tok = skip_list_.template tls_token_nn<Token>();
-    tok->acquire(&skip_list_);
-    const char* node = FindNode(k.user_key, tok);
+    const bool pin = skip_list_.need_pin();
+    Token* tok = nullptr;
+    if (pin) {
+      tok = skip_list_.template tls_token_nn<Token>();
+      tok->acquire(&skip_list_);
+    }
+    const char* node = FindNode(k.user_key);
     if (!node) {
-      ParkToken(tok);
+      if (pin) {
+        ParkToken(tok);
+      }
       return;
     }
     auto* vec = NodeVec(node);
@@ -885,7 +947,9 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
         }
       }
     }
-    ParkToken(tok);
+    if (pin) {
+      ParkToken(tok);
+    }
   }
 
   void GetPIK(const ReadOptions& ro, const ParsedInternalKey& k,
@@ -904,11 +968,17 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   Status SST_GetTpl(const ReadOptions& ro, ParsedInternalKey pikey,
                     GetContext* get_context) const {
     Status st;
-    auto* tok = skip_list_.template tls_token_nn<Token>();
-    tok->acquire(const_cast<OffsetSL*>(&skip_list_));
-    const char* node = FindNode(pikey.user_key, tok);
+    const bool pin = skip_list_.need_pin();
+    Token* tok = nullptr;
+    if (pin) {
+      tok = skip_list_.template tls_token_nn<Token>();
+      tok->acquire(const_cast<OffsetSL*>(&skip_list_));
+    }
+    const char* node = FindNode(pikey.user_key);
     if (!node) {
-      ParkToken(tok);
+      if (pin) {
+        ParkToken(tok);
+      }
       return st;
     }
     const SequenceNumber find_tag = pikey.GetTag();
@@ -940,7 +1010,9 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
         }
       }
     }
-    ParkToken(tok);
+    if (pin) {
+      ParkToken(tok);
+    }
     return st;
   }
 
@@ -955,79 +1027,37 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     return SST_GetTpl<KeyValueToMemRef>(ro, pikey, get_context);
   }
 
-  uint64_t ApproximateNumEntries(const Slice& start_ikey,
-                                 const Slice& end_ikey) override {
-    auto* tok = skip_list_.template tls_token_nn<Token>();
-    tok->acquire(const_cast<OffsetSL*>(&skip_list_));
-    uint64_t start_count =
-        skip_list_.EstimateCount(ExtractUserKey(start_ikey), tok);
-    uint64_t end_count =
-        skip_list_.EstimateCount(ExtractUserKey(end_ikey), tok);
-    ParkToken(tok);
-    return (end_count >= start_count) ? (end_count - start_count) : 0;
-  }
-
   uint64_t EstimateCountUkey(Slice ukey) const override {
-    auto* tok = skip_list_.template tls_token_nn<Token>();
-    tok->acquire(const_cast<OffsetSL*>(&skip_list_));
-    uint64_t n = skip_list_.EstimateCount(ukey, tok);
-    ParkToken(tok);
-    return n;
+    return skip_list_.EstimateCount(ukey);
   }
   uint64_t EstimateCountAll() const override {
-    if (skip_list_.is_readonly()) {
+    if (!skip_list_.need_pin()) {
       return EstimateCountAllTpl<true>();
     }
     return EstimateCountAllTpl<false>();
   }
-  template <bool ReadOnly>
+  template <bool NoPin>
   uint64_t EstimateCountAllTpl() const {
-    typename OffsetSL::template IteratorTpl<ReadOnly> it(&skip_list_);
+    typename OffsetSL::template IteratorTpl<NoPin> it(&skip_list_);
     it.SeekToLast();
     if (!it.Valid()) {
       return 0;
     }
-    if constexpr (ReadOnly) {
-      return skip_list_.EstimateCount(skip_list_.DecodeKey(it.key())) + 1;
-    } else {
-      return skip_list_.EstimateCount(skip_list_.DecodeKey(it.key()), &it) + 1;
-    }
-  }
-
-  void FillTableProperties(TableProperties* p) const override {
-    const size_t num_entries = p->num_entries;
-    const size_t num_user_keys = skip_list_.slow_exact_num_nodes();
-    p->tag_size = 8 * num_entries;
-    const size_t vec_hdr = sizeof(ValueVec) * num_user_keys;
-    if (ref_to_wal_ == OSLLogRefFormat::kPlainLogRef) {
-      p->data_size =
-          vec_hdr + (sizeof(KeyValueToLogRef) - sizeof(uint64_t)) * num_entries;
-    } else if (ref_to_wal_ == OSLLogRefFormat::kShortLogRef) {
-      p->data_size =
-          vec_hdr + (sizeof(KV_ToShortLogRef) - sizeof(uint64_t)) * num_entries;
-    } else {
-      p->data_size =
-          p->raw_value_size + vec_hdr +
-          (sizeof(KeyValueToMemRef) + 1 - sizeof(uint64_t)) * num_entries;
-    }
-    const size_t used =
-        skip_list_.mem_size() - skip_list_.mempool().frag_size();
-    const size_t rest = p->data_size + p->tag_size;
-    p->index_size = used > rest ? used - rest : 0;
+    return skip_list_.EstimateCount(skip_list_.DecodeKey(it.key())) + 1;
   }
 
   // Same sampling as InlineSkipList::FindRandomEntry / Iterator::RandomSeek.
   bool GetRandomInternalKeysAppend(
       size_t num, std::vector<std::string>* output) const override {
-    if (skip_list_.is_readonly()) {
+    if (!skip_list_.need_pin()) {
       return GetRandomInternalKeysAppendTpl<true>(num, output);
     }
     return GetRandomInternalKeysAppendTpl<false>(num, output);
   }
-  template <bool ReadOnly>
+  template <bool NoPin>
   bool GetRandomInternalKeysAppendTpl(size_t num,
                                       std::vector<std::string>* output) const {
-    typename OffsetSL::template IteratorTpl<ReadOnly> it(&skip_list_);
+    typename OffsetSL::template IteratorTpl<NoPin> it(&skip_list_);
     const size_t old = output->size();
     for (size_t i = 0; i < num; ++i) {
       it.RandomSeek();
@@ -1049,7 +1079,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     return output->size() > old;
   }
 
-  template <class Entry, bool ReadOnly>
+  template <class Entry, bool NoPin>
   class Iter : public MemTableRep::Iterator {
    public:
     explicit Iter(const OffsetSkipListRepT& rep)
@@ -1066,7 +1096,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     }
     Slice key() const override {
       TERARK_ASSERT_GE(idx_, 0);
-      return Slice(ikey_);
+      return Slice(ikey_.data(), ikey_.size());
     }
     Slice value() const override {
       TERARK_ASSERT_GE(idx_, 0);
@@ -1246,9 +1276,27 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
           rep_.base() + size_t(vec->pos) * kAlign);
     }
     void SetIkey() {
-      Slice uk = NodeUkey(iter_.key());
-      ikey_.assign(uk.data(), uk.size());
-      PutFixed64(&ikey_, Entries()[idx_].tag);
+      const char* node = iter_.key();
+      const uint64_t tag = Entries()[idx_].tag;
+      Slice uk = NodeUkey(node);
+      const size_t n = uk.size() + 8;
+      if (ikey_.size() != n) {
+        // resize populate only fills the grown tail; start from empty.
+        if (!ikey_.empty()) {
+          ikey_.clear();
+        }
+        ikey_.resize(n, [&](char* p, size_t) {
+          memcpy(p, uk.data(), uk.size());
+          EncodeFixed64(p + uk.size(), tag);
+        });
+        ikey_node_ = node;
+        return;
+      }
+      if (node != ikey_node_) {
+        memcpy(ikey_.data(), uk.data(), uk.size());
+        ikey_node_ = node;
+      }
+      EncodeFixed64(ikey_.data() + n - 8, tag);
     }
     void LandEqual(uint64_t find_tag) {
       idx_ = int(terark::upper_bound_0(Entries(), Num(), find_tag)) - 1;
@@ -1267,35 +1315,36 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     }
 
     const OffsetSkipListRepT& rep_;
-    typename OffsetSL::template IteratorTpl<ReadOnly> iter_;
+    typename OffsetSL::template IteratorTpl<NoPin> iter_;
     const char* prev_key_ = nullptr;
     Entry* snap_entries_ = nullptr;
     uint32_t snap_num_ = 0;
     int idx_ = -1;
     const size_t lookahead_;
-    std::string ikey_;
+    const char* ikey_node_ = nullptr;
+    terark::minimal_sso<64, false> ikey_;
   };
 
-  template <class Entry, bool ReadOnly>
+  template <class Entry, bool NoPin>
   static MemTableRep::Iterator* MakeIter(OffsetSkipListRepT* tab, Arena* a) {
-    using It = Iter<Entry, ReadOnly>;
+    using It = Iter<Entry, NoPin>;
     void* mem = a ? a->AllocateAligned(sizeof(It)) : operator new(sizeof(It));
     return new (mem) It(*tab);
   }
 
-  template <bool ReadOnly>
+  template <bool NoPin>
   MemTableRep::Iterator* MakeIterByEntry(Arena* arena) {
     if (ref_to_wal_ == OSLLogRefFormat::kPlainLogRef) {
-      return MakeIter<KeyValueToLogRef, ReadOnly>(this, arena);
+      return MakeIter<KeyValueToLogRef, NoPin>(this, arena);
     }
     if (ref_to_wal_ == OSLLogRefFormat::kShortLogRef) {
-      return MakeIter<KV_ToShortLogRef, ReadOnly>(this, arena);
+      return MakeIter<KV_ToShortLogRef, NoPin>(this, arena);
     }
-    return MakeIter<KeyValueToMemRef, ReadOnly>(this, arena);
+    return MakeIter<KeyValueToMemRef, NoPin>(this, arena);
   }
 
   MemTableRep::Iterator* GetIterator(Arena* arena = nullptr) override {
-    if (skip_list_.is_readonly()) {
+    if (!skip_list_.need_pin()) {
       return MakeIterByEntry<true>(arena);
     }
     return MakeIterByEntry<false>(arena);
@@ -1406,6 +1455,7 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
   OSLLogRefFormat log_ref_format = OSLLogRefFormat::kShortLogRef;
   OSLConvertKind convert_to_sst = OSLConvertKind::kDontConvert;
   bool token_use_idle = true;
+  bool enable_gc = true;
   bool sync_sst_file = true;
   std::string chroot_dir;
   std::atomic<size_t> cumu_num{0};
@@ -1463,6 +1513,7 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
     ROCKSDB_JSON_OPT_ENUM(js, log_ref_format);
     ROCKSDB_JSON_OPT_ENUM(js, convert_to_sst);
     ROCKSDB_JSON_OPT_PROP(js, token_use_idle);
+    ROCKSDB_JSON_OPT_PROP(js, enable_gc);
     ROCKSDB_JSON_OPT_PROP(js, sync_sst_file);
   }
   std::string ToString(const json& d, const SidePluginRepo&) const {
@@ -1479,6 +1530,7 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
     ROCKSDB_JSON_SET_ENUM(djs, log_ref_format);
     ROCKSDB_JSON_SET_ENUM(djs, convert_to_sst);
     ROCKSDB_JSON_SET_PROP(djs, token_use_idle);
+    ROCKSDB_JSON_SET_PROP(djs, enable_gc);
     ROCKSDB_JSON_SET_PROP(djs, sync_sst_file);
     ROCKSDB_JSON_SET_PROP(djs, chroot_dir);
     return djs;
@@ -1487,6 +1539,7 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
 
 void OffsetSkipListRep::BindFactoryTokenOpts() {
   token_use_idle_ = fac_->token_use_idle;
+  ApplyFactoryGc(fac_->enable_gc);
 }
 
 void OffsetSkipListRep::InitSetMemTableAsLogIndex(bool b) {
@@ -1769,10 +1822,12 @@ class OffsetSkipListTableReader : public TopTableReaderBase {
     auto log_ref_format = memtab_->ref_to_wal_;
     auto convert_to_sst = memtab_->convert_to_sst_;
     auto token_use_idle = memtab_->token_use_idle_;
+    auto enable_gc = memtab_->sl_is_gc_enabled();
     auto lookahead = memtab_->lookahead_;
     ROCKSDB_JSON_SET_ENUM(djs, log_ref_format);
     ROCKSDB_JSON_SET_ENUM(djs, convert_to_sst);
     ROCKSDB_JSON_SET_PROP(djs, token_use_idle);
+    ROCKSDB_JSON_SET_PROP(djs, enable_gc);
     ROCKSDB_JSON_SET_PROP(djs, lookahead);
 
     OffsetSkipListMeta meta;

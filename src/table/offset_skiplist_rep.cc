@@ -1718,6 +1718,9 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
   }
   Status s = tab->ConvertToSST(meta, tboptions);
   TEST_SYNC_POINT_CALLBACK("CrashSafeRecover::ConvertToSST:InjectStatus", &s);
+  if (s.ok() && (meta == nullptr || meta->fd.GetFileSize() == 0)) {
+    tab->has_converted_to_sst_ = false;
+  }
   TEST_SYNC_POINT("CrashSafeRecover::AfterRenameBeforeAddFile");
   if (tab->ref_to_wal_ != OSLLogRefFormat::kNoLogRef && tab->num_wals_) {
     TEST_SYNC_POINT("CrashSafeRecover::AfterLinkFile");
@@ -1754,7 +1757,7 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
     std::unique_ptr<MemTableRep::Iterator> probe(GetIterator(nullptr));
     probe->SeekToFirst();
     if (!probe->Valid()) {
-      return Status::InvalidArgument("OffsetSkipList ConvertToSST: empty");
+      return Status::OK();
     }
   }
   bool sync_sst_file = fac_->sync_sst_file;

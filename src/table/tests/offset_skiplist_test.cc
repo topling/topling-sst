@@ -2186,7 +2186,8 @@ TEST(OffsetSkipRepTest, ConvertToSST_Empty) {
   FileMetaData meta;
   meta.fd = FileDescriptor(1, 0, 0);
   mem->MarkImmutable();
-  ASSERT_TRUE(mem->ConvertToSST(&meta, tbo).IsInvalidArgument());
+  ASSERT_OK(mem->ConvertToSST(&meta, tbo));
+  ASSERT_EQ(0, meta.fd.GetFileSize());
 }
 
 TEST(OffsetSkipRepTest, ConvertToSST_FileMmap) {

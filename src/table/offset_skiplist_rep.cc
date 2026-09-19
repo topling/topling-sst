@@ -48,8 +48,15 @@
 #include <utility>
 
 #ifndef _MSC_VER
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
+
+#include <test_util/sync_point.h>
+#include <util/string_util.h>
 
 #include <db/dbformat.h>
 #include <db/memtable.h>
@@ -205,6 +212,8 @@ class OffsetSkipListRep : public MemTableRep {
   virtual const std::string& sl_mmap_fpath() const = 0;
   virtual fstring sl_get_mmap() const = 0;
   virtual void sl_set_readonly() = 0;
+  virtual terark::OSL_MmapHeader* sl_mmap_header() { return nullptr; }
+  virtual void sl_risk_bind_mmap(intptr_t, std::string, size_t) {}
   virtual bool sl_is_gc_enabled() const = 0;
   virtual uint64_t sl_slow_exact_num_nodes() const = 0;
   virtual size_t sl_mem_frag_size() const = 0;
@@ -312,6 +321,7 @@ class OffsetSkipListRep : public MemTableRep {
   Logger* log_;
   OSLConvertKind convert_to_sst_ = OSLConvertKind::kDontConvert;
   bool has_converted_to_sst_ = false;
+  SequenceNumber max_visible_seq_ = kMaxSequenceNumber;
   OSLLogRefFormat ref_to_wal_ = OSLLogRefFormat::kNoLogRef;
   bool token_use_idle_ = true;
   size_t num_wals_ = 0;
@@ -343,6 +353,10 @@ class OffsetSkipListRep : public MemTableRep {
     wals_[i].fileno = fileno;
     as_atomic(num_wals_).fetch_add(1);
     intrusive_ptr_add_ref(const_cast<ReadonlyFileMmap*>(wal));
+    if (auto* h = sl_mmap_header()) {
+      h->wals[i].fileno = fileno;
+      h->num_wals = static_cast<uint32_t>(num_wals_);
+    }
     return i;
   }
 
@@ -534,6 +548,12 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   }
   fstring sl_get_mmap() const final { return skip_list_.get_mmap(); }
   void sl_set_readonly() final { skip_list_.set_readonly(); }
+  terark::OSL_MmapHeader* sl_mmap_header() final {
+    return skip_list_.mmap_header();
+  }
+  void sl_risk_bind_mmap(intptr_t fd, std::string path, size_t n) final {
+    skip_list_.risk_bind_mmap(fd, std::move(path), n);
+  }
   bool sl_is_gc_enabled() const final { return skip_list_.is_gc_enabled(); }
   uint64_t sl_slow_exact_num_nodes() const final {
     return skip_list_.slow_exact_num_nodes();
@@ -872,6 +892,9 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   bool Contains(const Slice& internal_key) const override {
     Slice ukey = ExtractUserKey(internal_key);
     uint64_t find_tag = DecodeFixed64(ukey.end());
+    if (!VisibleTag(find_tag, find_tag >> 8, max_visible_seq_)) {
+      return false;
+    }
     const bool pin = skip_list_.need_pin();
     Token* tok = nullptr;
     if (pin) {
@@ -926,7 +949,8 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     auto* vec = NodeVec(node);
     size_t num = LoadUnlockedNum(vec);
     auto* entry = reinterpret_cast<Entry*>(base() + size_t(vec->pos) * kAlign);
-    intptr_t idx = intptr_t(terark::upper_bound_0(entry, num, k.GetTag()));
+    const SequenceNumber find_tag = CapFindTag(k.GetTag(), max_visible_seq_);
+    intptr_t idx = intptr_t(terark::upper_bound_0(entry, num, find_tag));
     if (UNLIKELY(ro.just_check_key_exists)) {
       while (idx--) {
         uint64_t tag = entry[idx].tag;
@@ -981,7 +1005,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       }
       return st;
     }
-    const SequenceNumber find_tag = pikey.GetTag();
+    const SequenceNumber find_tag = CapFindTag(pikey.GetTag(), max_visible_seq_);
     Cleanable noop_pinner;
     Cleanable* pinner =
         ro.internal_is_in_pinning_section ? &noop_pinner : nullptr;
@@ -1485,17 +1509,21 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
     auto convert = convert_to_sst;
     auto uc = cmp.icomparator()->user_comparator();
     if (convert == OSLConvertKind::kFileMmap) {
-      auto idx = cumu_num.fetch_add(1, std::memory_order_relaxed);
-      terark::string_appender<> path;
-      path | chroot_dir | level0_dir;
-      if (!path.empty() && path.end()[-1] != '/') {
-        path | "/";
+      for (;;) {
+        auto idx = cumu_num.fetch_add(1, std::memory_order_relaxed);
+        terark::string_appender<> path;
+        path | chroot_dir | level0_dir;
+        if (!path.empty() && path.end()[-1] != '/') {
+          path | "/";
+        }
+        path ^ "OffsetSkipList-%06zd.memtab-" ^ idx ^ cf_id;
+        if (::access(path.c_str(), F_OK) != 0) {
+          auto* r = NewOSLRep(uc, allocator, transform, lookahead, cap, this,
+                              logger, convert, path.str());
+          r->BindFactoryTokenOpts();
+          return r;
+        }
       }
-      path ^ "OffsetSkipList-%06zd.memtab-" ^ idx ^ cf_id;
-      auto* r = NewOSLRep(uc, allocator, transform, lookahead, cap, this,
-                          logger, convert, path.str());
-      r->BindFactoryTokenOpts();
-      return r;
     }
     auto* r = NewOSLRep(uc, allocator, transform, lookahead, cap, this, logger,
                         convert);
@@ -1506,6 +1534,58 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
   const char* Name() const final { return "OffsetSkipList"; }
   bool IsInsertConcurrentlySupported() const final { return true; }
   bool CanHandleDuplicatedKey() const final { return true; }
+  bool SupportCrashSafe() const final { return true; }
+  void ListCrashSafeLeftovers(const std::string& cf_dir,
+                              std::vector<std::string>* leftovers) const final {
+    if (leftovers == nullptr) {
+      return;
+    }
+    std::string dir = chroot_dir + cf_dir;
+    DIR* d = ::opendir(dir.c_str());
+    if (d == nullptr) {
+      return;
+    }
+    while (auto* ent = ::readdir(d)) {
+      const char* name = ent->d_name;
+      if (strncmp(name, "OffsetSkipList-", 15) == 0 &&
+          strstr(name, ".memtab-") != nullptr) {
+        leftovers->emplace_back(dir + "/" + name);
+      }
+    }
+    ::closedir(d);
+  }
+  Status ProbeCrashSafeLeftover(const std::string& leftover_path,
+                                const std::string& wal_dir = "") const final {
+    int fd = ::open(leftover_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+      return Status::IOError(leftover_path, errnoStr(errno).c_str());
+    }
+    terark::OSL_MmapHeader hdr{};
+    ssize_t n = ::pread(fd, &hdr, sizeof(hdr), 0);
+    ::close(fd);
+    if (n != static_cast<ssize_t>(sizeof(hdr))) {
+      return Status::Corruption(leftover_path, "short OSL header");
+    }
+    if (hdr.magic != terark::kOSLMmapHeaderMagic) {
+      return Status::Corruption(leftover_path, "missing OSL mmap header");
+    }
+    if ((hdr.log_ref != 0 || hdr.num_wals > 0) && !wal_dir.empty()) {
+      for (uint32_t i = 0; i < hdr.num_wals && i < 16; ++i) {
+        if (hdr.wals[i].fileno == 0) {
+          continue;
+        }
+        const std::string walname = LogFileName(wal_dir, hdr.wals[i].fileno);
+        if (::access(walname.c_str(), F_OK) != 0) {
+          return Status::Corruption(leftover_path,
+                                    "cannot rebind WAL " + walname);
+        }
+      }
+    }
+    return Status::OK();
+  }
+  Status RecoverCrashSafeMemTableToSST(
+      const std::string& leftover_path, SequenceNumber max_visible_seq,
+      FileMetaData* meta, const TableBuilderOptions& tboptions) final;
 
   void Update(const json&, const json& js, const SidePluginRepo&) {
     ROCKSDB_JSON_OPT_PROP(js, lookahead);
@@ -1544,6 +1624,122 @@ void OffsetSkipListRep::BindFactoryTokenOpts() {
 
 void OffsetSkipListRep::InitSetMemTableAsLogIndex(bool b) {
   ref_to_wal_ = b ? fac_->log_ref_format : OSLLogRefFormat::kNoLogRef;
+  if (auto* h = sl_mmap_header()) {
+    h->log_ref = static_cast<uint32_t>(ref_to_wal_);
+  }
+}
+
+Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
+    const std::string& leftover_path, SequenceNumber max_visible_seq,
+    FileMetaData* meta, const TableBuilderOptions& tboptions) {
+  TEST_SYNC_POINT("CrashSafeRecover::BeforeConvertLeftover");
+  int fd = ::open(leftover_path.c_str(), O_RDWR);
+  if (fd < 0) {
+    return Status::IOError(leftover_path, errnoStr(errno).c_str());
+  }
+  struct stat st;
+  if (::fstat(fd, &st) != 0) {
+    ::close(fd);
+    return Status::IOError(leftover_path, errnoStr(errno).c_str());
+  }
+  if (st.st_size < static_cast<off_t>(sizeof(terark::OSL_MmapHeader))) {
+    ::close(fd);
+    return Status::Corruption(leftover_path, "short OSL header");
+  }
+  void* p = ::mmap(nullptr, size_t(st.st_size), PROT_READ | PROT_WRITE,
+                   MAP_SHARED, fd, 0);
+  if (p == MAP_FAILED) {
+    ::close(fd);
+    return Status::IOError(leftover_path, errnoStr(errno).c_str());
+  }
+  auto* hdr = static_cast<terark::OSL_MmapHeader*>(p);
+  if (hdr->magic != terark::kOSLMmapHeaderMagic) {
+    ::munmap(p, size_t(st.st_size));
+    ::close(fd);
+    return Status::Corruption(leftover_path, "missing OSL mmap header");
+  }
+  hdr->max_visible_seq = max_visible_seq;
+  Status trunc_s;
+  TEST_SYNC_POINT_CALLBACK("CrashSafeRecover::Truncate:InjectStatus", &trunc_s);
+  if (!trunc_s.ok()) {
+    ::munmap(p, size_t(st.st_size));
+    ::close(fd);
+    return trunc_s;
+  }
+  const size_t used = static_cast<size_t>(hdr->mem_used);
+  if (st.st_size != static_cast<off_t>(used)) {
+    if (::ftruncate(fd, static_cast<off_t>(used)) != 0) {
+      ::munmap(p, size_t(st.st_size));
+      ::close(fd);
+      return Status::IOError(leftover_path, errnoStr(errno).c_str());
+    }
+  }
+  TEST_SYNC_POINT("CrashSafeRecover::AfterTruncate");
+  OffsetSkipListMeta sst_meta{};
+  sst_meta.version = kMetaVersion;
+  sst_meta.log_ref = hdr->log_ref;
+  sst_meta.mem_used = hdr->mem_used;
+  sst_meta.head_loc = hdr->head_loc;
+  sst_meta.max_height = hdr->max_height;
+  sst_meta.k_max_height = hdr->k_max_height;
+  sst_meta.k_branching = hdr->k_branching;
+  sst_meta.num_user_keys = 0;
+  std::unique_ptr<OffsetSkipListRep> tab(NewOSLRepAttach(
+      tboptions.internal_comparator.user_comparator(), &sst_meta,
+      static_cast<byte_t*>(p), this, tboptions.ioptions.logger));
+  tab->sl_risk_bind_mmap(fd, leftover_path, used);
+  tab->convert_to_sst_ = OSLConvertKind::kFileMmap;
+  tab->has_converted_to_sst_ = true;
+  tab->max_visible_seq_ = max_visible_seq;
+  tab->ref_to_wal_ = static_cast<OSLLogRefFormat>(hdr->log_ref);
+  tab->BindFactoryTokenOpts();
+  if (hdr->num_wals > 0) {
+    FileSystem* fs = tboptions.ioptions.fs.get();
+    for (uint32_t i = 0; i < hdr->num_wals && i < OffsetSkipListRep::MAX_WALS;
+         ++i) {
+      if (hdr->wals[i].fileno == 0) {
+        continue;
+      }
+      const std::string walname =
+          LogFileName(tboptions.ioptions.GetWalDir(), hdr->wals[i].fileno);
+      boost::intrusive_ptr<ReadonlyFileMmap> fmap;
+      IOStatus ios =
+          ReadonlyFileMmap::New(&fmap, *fs, hdr->wals[i].fileno, walname);
+      if (!ios.ok() || !fmap) {
+        return Status::Corruption(leftover_path, "cannot rebind WAL " + walname);
+      }
+      tab->wals_[i].fileno = hdr->wals[i].fileno;
+      tab->wals_[i].cnt = hdr->wals[i].cnt;
+      tab->wals_[i].bytes = hdr->wals[i].bytes;
+      tab->wals_[i].wal = fmap.get();
+      tab->num_wals_++;
+      intrusive_ptr_add_ref(fmap.get());
+    }
+  }
+  Status s = tab->ConvertToSST(meta, tboptions);
+  TEST_SYNC_POINT_CALLBACK("CrashSafeRecover::ConvertToSST:InjectStatus", &s);
+  TEST_SYNC_POINT("CrashSafeRecover::AfterRenameBeforeAddFile");
+  if (tab->ref_to_wal_ != OSLLogRefFormat::kNoLogRef && tab->num_wals_) {
+    TEST_SYNC_POINT("CrashSafeRecover::AfterLinkFile");
+  }
+  TEST_SYNC_POINT("CrashSafeRecover::AfterOneLeftoverConvert");
+  if (s.ok() && meta != nullptr) {
+    std::unique_ptr<MemTableRep::Iterator> it(tab->GetIterator(nullptr));
+    SequenceNumber smallest = kMaxSequenceNumber, largest = 0;
+    size_t n = 0;
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      const SequenceNumber seq = GetInternalKeySeqno(it->key());
+      smallest = std::min(smallest, seq);
+      largest = std::max(largest, seq);
+      n++;
+    }
+    if (n > 0) {
+      meta->fd.smallest_seqno = smallest;
+      meta->fd.largest_seqno = largest;
+      meta->num_entries = n;
+    }
+  }
+  return s;
 }
 
 Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
@@ -1650,6 +1846,8 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
         auto refname = BlobFileName(ioptions.cf_paths[0].path, blob_no);
         IOStatus ios =
             fs->LinkFile(walname, refname, fopt.io_options, &dbg_ctx);
+        TEST_SYNC_POINT_CALLBACK("CrashSafeRecover::LinkFile:InjectStatus",
+                                 &ios);
         if (!ios.ok()) {
           builder.Abandon();
           return fail_after_open(ios);
@@ -1946,6 +2144,12 @@ OffsetSkipListTableReader::OffsetSkipListTableReader(
       f->memtable_factory.get(), tro.ioptions.logger));
   memtab_->BindFactoryTokenOpts();
   memtab_->ref_to_wal_ = static_cast<OSLLogRefFormat>(sst_meta->log_ref);
+  if (file_data.size() >= sizeof(terark::OSL_MmapHeader)) {
+    auto* h = reinterpret_cast<const terark::OSL_MmapHeader*>(file_data.data());
+    if (h->magic == terark::kOSLMmapHeaderMagic) {
+      memtab_->max_visible_seq_ = h->max_visible_seq;
+    }
+  }
   table_properties_->compression_name = "OffsetSkipList";
   std::string& compression_options = table_properties_->compression_options;
   if (Slice(compression_options).starts_with("LogRef:")) {

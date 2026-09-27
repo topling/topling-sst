@@ -1,6 +1,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -1025,7 +1027,8 @@ TEST_F(OffsetSkipTest, AttachReadonlySeesKeys) {
       cmp,
       terark::fstring(reinterpret_cast<const char*>(src.mem_data()),
                       src.mem_size()),
-      src.head_loc(), src.max_height(), src.k_branching(), src.num_nodes());
+      src.head_loc(), src.k_max_height(), src.max_height(), src.k_branching(),
+      src.num_nodes());
   ASSERT_TRUE(attached.is_readonly());
   ASSERT_EQ(attached.num_nodes(), src.num_nodes());
   static_assert(std::is_base_of<TestOffsetSkipList::Token,
@@ -1981,6 +1984,7 @@ TEST(OffsetSkipRepTest, SupportFlags) {
   Arena arena;
   {
     auto fac = EasyNewMemTableRep("OffsetSkipList", "{}");
+    ASSERT_FALSE(fac->SupportCrashSafe());
     std::unique_ptr<MemTableRep> rep(
         fac->CreateMemTableRep(cmp, &arena, nullptr, nullptr));
     ASSERT_FALSE(rep->SupportMemTableAsLogIndex());
@@ -2183,7 +2187,8 @@ TEST(OffsetSkipRepTest, ConvertToSST_Empty) {
   FileMetaData meta;
   meta.fd = FileDescriptor(1, 0, 0);
   mem->MarkImmutable();
-  ASSERT_TRUE(mem->ConvertToSST(&meta, tbo).IsInvalidArgument());
+  ASSERT_OK(mem->ConvertToSST(&meta, tbo));
+  ASSERT_EQ(0, meta.fd.GetFileSize());
 }
 
 TEST(OffsetSkipRepTest, ConvertToSST_FileMmap) {
@@ -2748,6 +2753,58 @@ TEST(OffsetSkipRepTest, LogRef_PlainAndSameKey) {
   it->Next();
   ASSERT_FALSE(it->Valid());
   it->~InternalIterator();
+}
+
+TEST(OffsetSkipRepTest, FileMmapHeaderAtOffsetZero) {
+  std::string dir = test::PerThreadDBPath("osl_mmap_header");
+  ASSERT_OK(Env::Default()->CreateDirIfMissing(dir));
+  Options options;
+  options.cf_paths = {{dir, 0}};
+  WriteBufferManager wb(options.db_write_buffer_size);
+  std::unique_ptr<MemTable> mem(NewOffsetMemTable(
+      &options, &wb, R"({"mem_cap":16777216,"convert_to_sst":"kFileMmap"})"));
+  ASSERT_TRUE(mem->SupportConvertToSST());
+  ASSERT_OK(mem->Add(1, kTypeValue, "k", "v", nullptr));
+
+  std::vector<std::string> leftovers;
+  options.memtable_factory->ListCrashSafeLeftovers(dir, &leftovers);
+  ASSERT_FALSE(leftovers.empty());
+  int fd = ::open(leftovers[0].c_str(), O_RDONLY);
+  ASSERT_GE(fd, 0);
+  terark::OSL_MmapHeader hdr{};
+  ASSERT_EQ(::pread(fd, &hdr, sizeof(hdr), 0),
+            static_cast<ssize_t>(sizeof(hdr)));
+  ::close(fd);
+  ASSERT_STREQ(hdr.magic, terark::kOSLMmapHeaderMagic);
+  ASSERT_NE(hdr.head_loc, 0U);
+  ASSERT_GE(hdr.mem_used, 512U);
+  ASSERT_OK(options.memtable_factory->ProbeCrashSafeLeftover(leftovers[0], dir));
+}
+
+TEST(OffsetSkipRepTest, CreateMemTableRepDoesNotOverwriteLeftover) {
+  std::string dir = test::PerThreadDBPath("osl_no_overwrite");
+  ASSERT_OK(Env::Default()->CreateDirIfMissing(dir));
+  Options options;
+  options.cf_paths = {{dir, 0}};
+  WriteBufferManager wb(options.db_write_buffer_size);
+  std::unique_ptr<MemTable> mem(NewOffsetMemTable(
+      &options, &wb, R"({"mem_cap":16777216,"convert_to_sst":"kFileMmap"})"));
+  ASSERT_OK(mem->Add(1, kTypeValue, "keep", "me", nullptr));
+  std::vector<std::string> leftovers;
+  options.memtable_factory->ListCrashSafeLeftovers(dir, &leftovers);
+  ASSERT_EQ(leftovers.size(), 1U);
+  const std::string first_path = leftovers[0];
+  std::string before;
+  ASSERT_OK(ReadFileToString(Env::Default(), first_path, &before));
+  std::unique_ptr<MemTable> mem2(NewOffsetMemTable(
+      &options, &wb, R"({"mem_cap":16777216,"convert_to_sst":"kFileMmap"})"));
+  ASSERT_OK(mem2->Add(2, kTypeValue, "other", "x", nullptr));
+  leftovers.clear();
+  options.memtable_factory->ListCrashSafeLeftovers(dir, &leftovers);
+  ASSERT_GE(leftovers.size(), 2U);
+  std::string after;
+  ASSERT_OK(ReadFileToString(Env::Default(), first_path, &after));
+  ASSERT_EQ(before, after);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

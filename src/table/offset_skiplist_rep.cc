@@ -45,11 +45,19 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 #ifndef _MSC_VER
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
+
+#include <test_util/sync_point.h>
+#include <util/string_util.h>
 
 #include <db/dbformat.h>
 #include <db/memtable.h>
@@ -114,6 +122,26 @@ struct OffsetSkipListMeta {
 };
 #pragma pack(pop)
 
+// WAL slots live here, not in the ADT header. Placed at OSL_MmapHeader::reserved.
+struct OSLRepHeader {
+  static constexpr uint32_t kMaxWals = 16;
+  uint32_t log_ref;
+  uint32_t num_wals;
+  struct WalSlot {
+    uint64_t fileno;
+    uint64_t cnt;
+    uint64_t bytes;
+  } wals[kMaxWals];
+};
+static_assert(sizeof(OSLRepHeader) <= sizeof(terark::OSL_MmapHeader::reserved));
+
+inline OSLRepHeader* RepHdr(terark::OSL_MmapHeader* h) {
+  return reinterpret_cast<OSLRepHeader*>(h->reserved);
+}
+inline const OSLRepHeader* RepHdr(const terark::OSL_MmapHeader* h) {
+  return reinterpret_cast<const OSLRepHeader*>(h->reserved);
+}
+
 static Slice NodeUkey(const char* p) { return Slice(p + 4, DecodeFixed32(p)); }
 
 // Same 3-way Cmp split as Version::GetInst / DBIter::SetFuncPtr:
@@ -159,6 +187,60 @@ struct OffsetSkipListValueVec {
 };
 using ValueVec = OffsetSkipListValueVec;
 
+#define OSL_STRINGIZE_IMPL(x) #x
+#define OSL_STRINGIZE(x) OSL_STRINGIZE_IMPL(x)
+
+using OffsetSkipListBytewiseCmp = terark::OffsetSkipList<
+    UserKeyCmp<ForwardBytewiseCompareUserKeyNoTS>, 4, OffsetSkipListValueVec>;
+using OffsetSkipListRevBytewiseCmp = terark::OffsetSkipList<
+    UserKeyCmp<ReverseBytewiseCompareUserKeyNoTS>, 4, OffsetSkipListValueVec>;
+using OffsetSkipListVirtualCmp = terark::OffsetSkipList<
+    UserKeyCmp<FallbackUserKeySliceCmp>, 4, OffsetSkipListValueVec>;
+
+template <class SliceCmp>
+struct OSLTypedefName;
+template <>
+struct OSLTypedefName<ForwardBytewiseCompareUserKeyNoTS> {
+  using type = OffsetSkipListBytewiseCmp;
+  static constexpr const char* value = OSL_STRINGIZE(OffsetSkipListBytewiseCmp);
+};
+template <>
+struct OSLTypedefName<ReverseBytewiseCompareUserKeyNoTS> {
+  using type = OffsetSkipListRevBytewiseCmp;
+  static constexpr const char* value = OSL_STRINGIZE(OffsetSkipListRevBytewiseCmp);
+};
+template <>
+struct OSLTypedefName<FallbackUserKeySliceCmp> {
+  using type = OffsetSkipListVirtualCmp;
+  static constexpr const char* value = OSL_STRINGIZE(OffsetSkipListVirtualCmp);
+};
+static_assert(sizeof(OSL_STRINGIZE(OffsetSkipListBytewiseCmp)) <=
+              sizeof(terark::OSL_MmapHeader::class_name));
+static_assert(sizeof(OSL_STRINGIZE(OffsetSkipListRevBytewiseCmp)) <=
+              sizeof(terark::OSL_MmapHeader::class_name));
+static_assert(sizeof(OSL_STRINGIZE(OffsetSkipListVirtualCmp)) <=
+              sizeof(terark::OSL_MmapHeader::class_name));
+
+Status CheckOSLMmapHeader(const terark::OSL_MmapHeader& hdr, uint64_t file_size,
+                          const std::string& path) {
+  if (strcmp(hdr.magic, terark::kOSLMmapHeaderMagic) != 0) {
+    return Status::Corruption(path, "missing OSL mmap header");
+  }
+  if (hdr.mem_used < sizeof(hdr) || hdr.mem_used > file_size ||
+      hdr.k_max_height == 0 ||
+      hdr.k_max_height > OffsetSkipListBytewiseCmp::kMaxPossibleHeight ||
+      hdr.max_height == 0 || hdr.max_height > hdr.k_max_height ||
+      hdr.k_branching <= 1) {
+    return Status::Corruption(path, "bad OSL mmap header");
+  }
+  const uint32_t nwal =
+      as_atomic(RepHdr(&hdr)->num_wals).load(std::memory_order_acquire);
+  if (nwal > OSLRepHeader::kMaxWals) {
+    return Status::Corruption(path, "too many WALs");
+  }
+  return Status::OK();
+}
+
 static size_t AlignUp4(size_t n) { return (n + 3) & ~size_t(3); }
 
 static size_t EncValueLen(size_t raw) {
@@ -175,11 +257,7 @@ static ValueVec* NodeVec(const char* p) {
 }
 
 static uint32_t LoadUnlockedNum(const ValueVec* vec) {
-  uint32_t num;
-  while (kLockFlag & (num = as_atomic(vec->num).load(std::memory_order_acquire))) {
-    std::this_thread::yield();
-  }
-  return num;
+  return as_atomic(vec->num).load(std::memory_order_acquire) & ~kLockFlag;
 }
 
 static uint32_t CapOf(uint32_t num) {
@@ -205,6 +283,9 @@ class OffsetSkipListRep : public MemTableRep {
   virtual const std::string& sl_mmap_fpath() const = 0;
   virtual fstring sl_get_mmap() const = 0;
   virtual void sl_set_readonly() = 0;
+  virtual terark::OSL_MmapHeader* sl_mmap_header() { return nullptr; }
+  virtual const char* sl_class_name() const = 0;
+  virtual void sl_risk_bind_mmap(intptr_t, std::string, size_t) {}
   virtual bool sl_is_gc_enabled() const = 0;
   virtual uint64_t sl_slow_exact_num_nodes() const = 0;
   virtual size_t sl_mem_frag_size() const = 0;
@@ -304,6 +385,7 @@ class OffsetSkipListRep : public MemTableRep {
     const ReadonlyFileMmap* wal = nullptr;
   };
   static constexpr size_t MAX_WALS = 16;
+  static_assert(MAX_WALS == OSLRepHeader::kMaxWals);
 
   const Comparator* ucmp_;
   const SliceTransform* transform_;
@@ -312,6 +394,7 @@ class OffsetSkipListRep : public MemTableRep {
   Logger* log_;
   OSLConvertKind convert_to_sst_ = OSLConvertKind::kDontConvert;
   bool has_converted_to_sst_ = false;
+  SequenceNumber max_visible_seq_ = kMaxSequenceNumber;
   OSLLogRefFormat ref_to_wal_ = OSLLogRefFormat::kNoLogRef;
   bool token_use_idle_ = true;
   size_t num_wals_ = 0;
@@ -343,6 +426,16 @@ class OffsetSkipListRep : public MemTableRep {
     wals_[i].fileno = fileno;
     as_atomic(num_wals_).fetch_add(1);
     intrusive_ptr_add_ref(const_cast<ReadonlyFileMmap*>(wal));
+    if (auto* h = sl_mmap_header()) {
+      auto* rh = RepHdr(h);
+      rh->wals[i].fileno = fileno;
+      // A process can crash inside the critical section, before mutex unlock.
+      // Only compiler reordering needs to be prevented here, but there is no
+      // corresponding standard way to express this, so use the stronger
+      // memory_order_release.
+      as_atomic(rh->num_wals).store(static_cast<uint32_t>(num_wals_),
+                                   std::memory_order_release);
+    }
     return i;
   }
 
@@ -444,6 +537,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
  public:
   using OffsetSL =
       terark::OffsetSkipList<UserKeyCmp<SliceCmp>, 4, OffsetSkipListValueVec>;
+  static_assert(std::is_same<OffsetSL, typename OSLTypedefName<SliceCmp>::type>::value);
   OffsetSL skip_list_;
 
   struct Token : OffsetSL::Token {
@@ -500,7 +594,8 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
                      OSLConvertKind convert, const std::string& mmap_path)
       : OffsetSkipListRep(allocator, ucmp, transform, lookahead, fac, log,
                           convert),
-        skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem_cap, mmap_path) {}
+        skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem_cap, mmap_path,
+                   OSLTypedefName<SliceCmp>::value) {}
 
   ~OffsetSkipListRepT() override {
     if (convert_to_sst_ == OSLConvertKind::kFileMmap &&
@@ -510,12 +605,12 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   }
 
   OffsetSkipListRepT(const Comparator* ucmp, fstring mem, uint32_t head_loc,
-                     int max_height, int32_t branching, uint64_t num_nodes,
-                     OffsetSkipListFactory* fac, Logger* log)
+                     int height_limit, int current_height, int32_t branching,
+                     uint64_t num_nodes, OffsetSkipListFactory* fac, Logger* log)
       : OffsetSkipListRep(nullptr, ucmp, nullptr, 0, fac, log,
                           OSLConvertKind::kDontConvert),
         skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem, head_loc,
-                   max_height, branching, num_nodes) {}
+                   height_limit, current_height, branching, num_nodes) {}
 
   byte_t* base() const final {
     return const_cast<byte_t*>(skip_list_.mem_data());
@@ -534,6 +629,13 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   }
   fstring sl_get_mmap() const final { return skip_list_.get_mmap(); }
   void sl_set_readonly() final { skip_list_.set_readonly(); }
+  terark::OSL_MmapHeader* sl_mmap_header() final {
+    return skip_list_.mmap_header();
+  }
+  const char* sl_class_name() const final { return skip_list_.class_name(); }
+  void sl_risk_bind_mmap(intptr_t fd, std::string path, size_t n) final {
+    skip_list_.risk_bind_mmap(fd, std::move(path), n);
+  }
   bool sl_is_gc_enabled() const final { return skip_list_.is_gc_enabled(); }
   uint64_t sl_slow_exact_num_nodes() const final {
     return skip_list_.slow_exact_num_nodes();
@@ -872,6 +974,9 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   bool Contains(const Slice& internal_key) const override {
     Slice ukey = ExtractUserKey(internal_key);
     uint64_t find_tag = DecodeFixed64(ukey.end());
+    if (!VisibleTag(find_tag, find_tag >> 8, max_visible_seq_)) {
+      return false;
+    }
     const bool pin = skip_list_.need_pin();
     Token* tok = nullptr;
     if (pin) {
@@ -926,7 +1031,8 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     auto* vec = NodeVec(node);
     size_t num = LoadUnlockedNum(vec);
     auto* entry = reinterpret_cast<Entry*>(base() + size_t(vec->pos) * kAlign);
-    intptr_t idx = intptr_t(terark::upper_bound_0(entry, num, k.GetTag()));
+    const SequenceNumber find_tag = CapFindTag(k.GetTag(), max_visible_seq_);
+    intptr_t idx = intptr_t(terark::upper_bound_0(entry, num, find_tag));
     if (UNLIKELY(ro.just_check_key_exists)) {
       while (idx--) {
         uint64_t tag = entry[idx].tag;
@@ -981,7 +1087,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       }
       return st;
     }
-    const SequenceNumber find_tag = pikey.GetTag();
+    const SequenceNumber find_tag = CapFindTag(pikey.GetTag(), max_visible_seq_);
     Cleanable noop_pinner;
     Cleanable* pinner =
         ro.internal_is_in_pinning_section ? &noop_pinner : nullptr;
@@ -1326,7 +1432,67 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   };
 
   template <class Entry, bool NoPin>
+  class VisibleIter final : public Iter<Entry, NoPin> {
+    using Base = Iter<Entry, NoPin>;
+    const SequenceNumber max_visible_seq_;
+
+    bool SkipForward() {
+      while (Base::Valid() &&
+             GetInternalKeySeqno(Base::key()) > max_visible_seq_) {
+        Base::NextAndCheckValid();
+      }
+      return Base::Valid();
+    }
+    bool SkipBackward() {
+      while (Base::Valid() &&
+             GetInternalKeySeqno(Base::key()) > max_visible_seq_) {
+        Base::PrevAndCheckValid();
+      }
+      return Base::Valid();
+    }
+
+   public:
+    explicit VisibleIter(const OffsetSkipListRepT& rep)
+        : Base(rep), max_visible_seq_(rep.max_visible_seq_) {}
+
+    using Base::Seek;
+    using Base::SeekForPrev;
+
+    bool NextAndCheckValid() final {
+      return Base::NextAndCheckValid() && SkipForward();
+    }
+    bool PrevAndCheckValid() final {
+      return Base::PrevAndCheckValid() && SkipBackward();
+    }
+    void Seek(const Slice& ikey, const char* memtable_key) final {
+      Base::Seek(ikey, memtable_key);
+      SkipForward();
+    }
+    void SeekForPrev(const Slice& ikey, const char* memtable_key) final {
+      Base::SeekForPrev(ikey, memtable_key);
+      SkipBackward();
+    }
+    void RandomSeek() final {
+      Base::RandomSeek();
+      SkipForward();
+    }
+    void SeekToFirst() final {
+      Base::SeekToFirst();
+      SkipForward();
+    }
+    void SeekToLast() final {
+      Base::SeekToLast();
+      SkipBackward();
+    }
+  };
+
+  template <class Entry, bool NoPin>
   static MemTableRep::Iterator* MakeIter(OffsetSkipListRepT* tab, Arena* a) {
+    if (tab->max_visible_seq_ != kMaxSequenceNumber) {
+      using It = VisibleIter<Entry, NoPin>;
+      void* mem = a ? a->AllocateAligned(sizeof(It)) : operator new(sizeof(It));
+      return new (mem) It(*tab);
+    }
     using It = Iter<Entry, NoPin>;
     void* mem = a ? a->AllocateAligned(sizeof(It)) : operator new(sizeof(It));
     return new (mem) It(*tab);
@@ -1442,7 +1608,7 @@ OffsetSkipListRep* NewOSLRepAttach(const Comparator* uc,
     using Cmp = decltype(tag);
     return new OffsetSkipListRepT<Cmp>(
         uc, fstring(reinterpret_cast<char*>(data), meta->mem_used),
-        meta->head_loc, meta->max_height, meta->k_branching,
+        meta->head_loc, meta->k_max_height, meta->max_height, meta->k_branching,
         meta->num_user_keys, fac, log);
   });
 }
@@ -1457,11 +1623,14 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
   bool token_use_idle = true;
   bool enable_gc = true;
   bool sync_sst_file = true;
+  bool allow_dangerous_update = false;
   std::string chroot_dir;
   std::atomic<size_t> cumu_num{0};
 
   OffsetSkipListFactory(const json& js, const SidePluginRepo& r) {
     ROCKSDB_JSON_OPT_PROP(js, chroot_dir);
+    ROCKSDB_JSON_OPT_PROP(js, allow_dangerous_update); // immutable
+    ROCKSDB_JSON_OPT_ENUM(js, convert_to_sst); // initial mode is unrestricted
     Update({}, js, r);
   }
 
@@ -1485,17 +1654,21 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
     auto convert = convert_to_sst;
     auto uc = cmp.icomparator()->user_comparator();
     if (convert == OSLConvertKind::kFileMmap) {
-      auto idx = cumu_num.fetch_add(1, std::memory_order_relaxed);
-      terark::string_appender<> path;
-      path | chroot_dir | level0_dir;
-      if (!path.empty() && path.end()[-1] != '/') {
-        path | "/";
+      for (;;) {
+        auto idx = cumu_num.fetch_add(1, std::memory_order_relaxed);
+        terark::string_appender<> path;
+        path | chroot_dir | level0_dir;
+        if (!path.empty() && path.end()[-1] != '/') {
+          path | "/";
+        }
+        path ^ "OffsetSkipList-%06zd.memtab-" ^ idx ^ cf_id;
+        if (::access(path.c_str(), F_OK) != 0) {
+          auto* r = NewOSLRep(uc, allocator, transform, lookahead, cap, this,
+                              logger, convert, path.str());
+          r->BindFactoryTokenOpts();
+          return r;
+        }
       }
-      path ^ "OffsetSkipList-%06zd.memtab-" ^ idx ^ cf_id;
-      auto* r = NewOSLRep(uc, allocator, transform, lookahead, cap, this,
-                          logger, convert, path.str());
-      r->BindFactoryTokenOpts();
-      return r;
     }
     auto* r = NewOSLRep(uc, allocator, transform, lookahead, cap, this, logger,
                         convert);
@@ -1506,15 +1679,94 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
   const char* Name() const final { return "OffsetSkipList"; }
   bool IsInsertConcurrentlySupported() const final { return true; }
   bool CanHandleDuplicatedKey() const final { return true; }
+  bool SupportCrashSafe() const final {
+    return convert_to_sst == OSLConvertKind::kFileMmap;
+  }
+  void ListCrashSafeLeftovers(const std::string& cf_dir,
+                              std::vector<std::string>* leftovers) final {
+    std::string dir = chroot_dir + cf_dir;
+    DIR* d = ::opendir(dir.c_str());
+    if (d == nullptr) {
+      return;
+    }
+    size_t next_num = 0;
+    while (auto* ent = ::readdir(d)) {
+      const char* name = ent->d_name;
+      if (strncmp(name, "OffsetSkipList-", 15) == 0 &&
+          strstr(name, ".memtab-") != nullptr) {
+        leftovers->emplace_back(dir + "/" + name);
+        Slice rest(name + 15);
+        uint64_t num;
+        if (ConsumeDecimalNumber(&rest, &num) && rest.starts_with(".memtab-") &&
+            num < SIZE_MAX) {
+          next_num = std::max(next_num, size_t(num + 1));
+        }
+      }
+    }
+    ::closedir(d);
+    terark::atomic_maximize(reinterpret_cast<size_t&>(cumu_num), next_num);
+  }
+  Status ProbeCrashSafeLeftover(const std::string& leftover_path,
+                                const std::string& wal_dir) const final {
+    int fd = ::open(leftover_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+      return Status::IOError(leftover_path, errnoStr(errno).c_str());
+    }
+    terark::OSL_MmapHeader hdr{};
+    ssize_t n = ::pread(fd, &hdr, sizeof(hdr), 0);
+    struct stat st;
+    const int st_err = ::fstat(fd, &st);
+    ::close(fd);
+    if (st_err != 0) {
+      return Status::IOError(leftover_path, errnoStr(errno).c_str());
+    }
+    if (n != static_cast<ssize_t>(sizeof(hdr))) {
+      return Status::Corruption(leftover_path, "short OSL header");
+    }
+    Status hs = CheckOSLMmapHeader(hdr, static_cast<uint64_t>(st.st_size),
+                                   leftover_path);
+    if (!hs.ok()) {
+      return hs;
+    }
+    const auto* rh = RepHdr(&hdr);
+    const uint32_t nwal =
+        as_atomic(rh->num_wals).load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < nwal; ++i) {
+      const std::string walname = LogFileName(wal_dir, rh->wals[i].fileno);
+      if (::access(walname.c_str(), F_OK) != 0) {
+        return Status::Corruption(leftover_path,
+                                  "cannot rebind WAL " + walname);
+      }
+    }
+    return Status::OK();
+  }
+  Status RecoverCrashSafeMemTableToSST(
+      const std::string& leftover_path, FileMetaData* meta,
+      const TableBuilderOptions& tboptions) final;
 
   void Update(const json&, const json& js, const SidePluginRepo&) {
+    bool allow_dangerous_update = this->allow_dangerous_update;
+    ROCKSDB_JSON_OPT_PROP(js, allow_dangerous_update);
+    if (allow_dangerous_update != this->allow_dangerous_update) {
+      THROW_InvalidArgument("allow_dangerous_update cannot be changed online");
+    }
+    auto convert_to_sst = this->convert_to_sst;
+    ROCKSDB_JSON_OPT_ENUM(js, convert_to_sst);
+    if (convert_to_sst != this->convert_to_sst && !allow_dangerous_update) {
+      THROW_InvalidArgument(
+          "changing convert_to_sst online requires allow_dangerous_update=true");
+    }
     ROCKSDB_JSON_OPT_PROP(js, lookahead);
     ROCKSDB_JSON_OPT_SIZE(js, mem_cap);
     ROCKSDB_JSON_OPT_ENUM(js, log_ref_format);
-    ROCKSDB_JSON_OPT_ENUM(js, convert_to_sst);
     ROCKSDB_JSON_OPT_PROP(js, token_use_idle);
     ROCKSDB_JSON_OPT_PROP(js, enable_gc);
     ROCKSDB_JSON_OPT_PROP(js, sync_sst_file);
+    if (convert_to_sst != this->convert_to_sst) {
+      fprintf(stderr, "WARN: %s: changing convert_to_sst online may invalidate "
+                      "crash-safe recovery\n", Name());
+      this->convert_to_sst = convert_to_sst;
+    }
   }
   std::string ToString(const json& d, const SidePluginRepo&) const {
     return JsonToString(ToJson(d), d);
@@ -1525,6 +1777,7 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
   json ToJson(const json& d) const { return ToJson(d, true); }
   json ToJson(const json& /*d*/, bool /*live_status*/) const {
     json djs;
+    ROCKSDB_JSON_SET_PROP(djs, allow_dangerous_update);
     ROCKSDB_JSON_SET_PROP(djs, lookahead);
     ROCKSDB_JSON_SET_SIZE(djs, mem_cap);
     ROCKSDB_JSON_SET_ENUM(djs, log_ref_format);
@@ -1544,6 +1797,107 @@ void OffsetSkipListRep::BindFactoryTokenOpts() {
 
 void OffsetSkipListRep::InitSetMemTableAsLogIndex(bool b) {
   ref_to_wal_ = b ? fac_->log_ref_format : OSLLogRefFormat::kNoLogRef;
+  if (auto* h = sl_mmap_header()) {
+    memset(h, 0, sizeof(*h));
+    terark::InitOSLMmapHeaderIdentity(h, sl_class_name());
+    h->mem_used = sl_mem_size();
+    h->head_loc = sl_head_loc();
+    h->max_height = static_cast<uint8_t>(sl_max_height());
+    h->k_max_height = static_cast<uint8_t>(sl_k_max_height());
+    h->k_branching = static_cast<uint8_t>(sl_k_branching());
+    RepHdr(h)->log_ref = static_cast<uint32_t>(ref_to_wal_);
+  }
+}
+
+Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
+    const std::string& leftover_path, FileMetaData* meta,
+    const TableBuilderOptions& tboptions) {
+  int fd = ::open(leftover_path.c_str(), O_RDWR);
+  if (fd < 0) {
+    return Status::IOError(leftover_path, errnoStr(errno).c_str());
+  }
+  struct stat st;
+  if (::fstat(fd, &st) != 0) {
+    ::close(fd);
+    return Status::IOError(leftover_path, errnoStr(errno).c_str());
+  }
+  if (st.st_size < static_cast<off_t>(sizeof(terark::OSL_MmapHeader))) {
+    ::close(fd);
+    return Status::Corruption(leftover_path, "short OSL header");
+  }
+  void* p = ::mmap(nullptr, size_t(st.st_size), PROT_READ | PROT_WRITE,
+                   MAP_SHARED, fd, 0);
+  if (p == MAP_FAILED) {
+    ::close(fd);
+    return Status::IOError(leftover_path, errnoStr(errno).c_str());
+  }
+  auto* hdr = static_cast<terark::OSL_MmapHeader*>(p);
+  Status hs = CheckOSLMmapHeader(*hdr, static_cast<uint64_t>(st.st_size),
+                                 leftover_path);
+  if (!hs.ok()) {
+    ::munmap(p, size_t(st.st_size));
+    ::close(fd);
+    return hs;
+  }
+  Status trunc_s;
+  TEST_SYNC_POINT_CALLBACK("CrashSafeRecover::Truncate:InjectStatus", &trunc_s);
+  if (!trunc_s.ok()) {
+    ::munmap(p, size_t(st.st_size));
+    ::close(fd);
+    return trunc_s;
+  }
+  const size_t used = static_cast<size_t>(hdr->mem_used);
+  if (::ftruncate(fd, static_cast<off_t>(used)) != 0) {
+    ::munmap(p, size_t(st.st_size));
+    ::close(fd);
+    return Status::IOError(leftover_path, errnoStr(errno).c_str());
+  }
+  const Comparator* uc = tboptions.internal_comparator.user_comparator();
+  auto recover = [&](auto cmp) -> Status {
+    using Rep = OffsetSkipListRepT<decltype(cmp)>;
+    Rep tab(uc, fstring(static_cast<char*>(p), used), hdr->head_loc,
+            hdr->k_max_height, hdr->max_height, hdr->k_branching, 0, this,
+            tboptions.ioptions.logger);
+    tab.sl_risk_bind_mmap(fd, leftover_path, size_t(st.st_size));
+    tab.convert_to_sst_ = OSLConvertKind::kFileMmap;
+    tab.max_visible_seq_ = meta->fd.largest_seqno;
+    tab.ref_to_wal_ = static_cast<OSLLogRefFormat>(RepHdr(hdr)->log_ref);
+    tab.BindFactoryTokenOpts();
+    const auto* rh = RepHdr(hdr);
+    const uint32_t nwal =
+        as_atomic(rh->num_wals).load(std::memory_order_acquire);
+    FileSystem* fs = tboptions.ioptions.fs.get();
+    for (uint32_t i = 0; i < nwal; ++i) {
+      const std::string walname =
+          LogFileName(tboptions.ioptions.GetWalDir(), rh->wals[i].fileno);
+      boost::intrusive_ptr<ReadonlyFileMmap> fmap;
+      IOStatus ios =
+          ReadonlyFileMmap::New(&fmap, *fs, rh->wals[i].fileno, walname);
+      if (!ios.ok()) {
+        return Status::Corruption(leftover_path, "cannot rebind WAL " + walname);
+      }
+      tab.wals_[i].fileno = rh->wals[i].fileno;
+      // TLS value counts are unavailable; retain each WAL as one whole blob.
+      tab.wals_[i].cnt = 1;
+      tab.wals_[i].bytes = fmap->size();
+      tab.wals_[i].wal = fmap.get();
+      tab.num_wals_++;
+      intrusive_ptr_add_ref(fmap.get());
+    }
+    Status s = tab.ConvertToSST(meta, tboptions);
+    TEST_SYNC_POINT_CALLBACK("CrashSafeRecover::ConvertToSST:InjectStatus", &s);
+    TEST_SYNC_POINT("CrashSafeRecover::AfterRenameBeforeAddFile");
+    return s;
+  };
+  if (uc->IsForwardBytewise()) {
+    ROCKSDB_ASSERT_EQ(uc->timestamp_size(), 0);
+    return recover(ForwardBytewiseCompareUserKeyNoTS{});
+  }
+  if (uc->IsReverseBytewise()) {
+    ROCKSDB_ASSERT_EQ(uc->timestamp_size(), 0);
+    return recover(ReverseBytewiseCompareUserKeyNoTS{});
+  }
+  return recover(FallbackUserKeySliceCmp{uc});
 }
 
 Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
@@ -1558,7 +1912,7 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
     std::unique_ptr<MemTableRep::Iterator> probe(GetIterator(nullptr));
     probe->SeekToFirst();
     if (!probe->Valid()) {
-      return Status::InvalidArgument("OffsetSkipList ConvertToSST: empty");
+      return Status::OK();
     }
   }
   bool sync_sst_file = fac_->sync_sst_file;
@@ -1650,6 +2004,7 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
         auto refname = BlobFileName(ioptions.cf_paths[0].path, blob_no);
         IOStatus ios =
             fs->LinkFile(walname, refname, fopt.io_options, &dbg_ctx);
+        TEST_SYNC_POINT_CALLBACK("CrashSafeRecover::LinkFile:InjectStatus", &ios);
         if (!ios.ok()) {
           builder.Abandon();
           return fail_after_open(ios);
@@ -1660,6 +2015,9 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
       }
       oss.pop_back();
     }
+  }
+  if (max_visible_seq_ != kMaxSequenceNumber) {
+    builder.properties_.compression_options += ";VisFilter:1";
   }
   Status s = builder.Finish();
   if (!s.ok()) {
@@ -1748,8 +2106,8 @@ class OffsetSkipListTableFactory : public TableFactory {
   }
   bool IsDeleteRangeSupported() const override { return false; }
   void Update(const json& q, const json& js, const SidePluginRepo& repo) {
-    ROCKSDB_JSON_OPT_PROP(js, populate_read);
     memtable_factory->Update(q, js, repo);
+    ROCKSDB_JSON_OPT_PROP(js, populate_read);
   }
   std::string ToString(const json& d, const SidePluginRepo&) const {
     json djs = memtable_factory->ToJson(d);
@@ -1948,6 +2306,13 @@ OffsetSkipListTableReader::OffsetSkipListTableReader(
   memtab_->ref_to_wal_ = static_cast<OSLLogRefFormat>(sst_meta->log_ref);
   table_properties_->compression_name = "OffsetSkipList";
   std::string& compression_options = table_properties_->compression_options;
+  const fstring opts(compression_options);
+  for (size_t pos = 0; pos < opts.size();) {
+    if (opts.iter_field(pos, ';') == "VisFilter:1") {
+      memtab_->max_visible_seq_ = tro.largest_seqno;
+      break;
+    }
+  }
   if (Slice(compression_options).starts_with("LogRef:")) {
     const char* item = strchr(compression_options.c_str(), ';');
     ROCKSDB_VERIFY(item != nullptr);

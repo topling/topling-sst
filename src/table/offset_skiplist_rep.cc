@@ -1923,24 +1923,19 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
                                     meta->fd.GetPathId());
   std::unique_ptr<FSWritableFile> fs_file;
   const bool is_file_mmap = convert_to_sst_ == OSLConvertKind::kFileMmap;
+  std::string src_fname;
   double t0 = clock->NowMicros();
   OffsetSkipListMeta sst_meta;
   FillMeta(&sst_meta);
   if (is_file_mmap) {
     sl_set_readonly();
-    std::string src_fname = sl_mmap_fpath();
+    src_fname = sl_mmap_fpath();
     size_t chroot_len = fac_->chroot_dir.size();
     TERARK_VERIFY_S_EQ(fstring(src_fname).prefix(chroot_len), fac_->chroot_dir);
     src_fname.erase(0, chroot_len);
-    IOStatus ios = fs->RenameFile(src_fname, fname, fopt.io_options, &dbg_ctx);
+    IOStatus ios = fs->ReopenWritableFile(src_fname, fopt, &fs_file, &dbg_ctx);
     if (!ios.ok()) {
-      ROCKS_LOG_ERROR(log_, "rename(%s, %s) = %s", src_fname.c_str(),
-                      fname.c_str(), ios.ToString().c_str());
-      return ios;
-    }
-    ios = fs->ReopenWritableFile(fname, fopt, &fs_file, &dbg_ctx);
-    if (!ios.ok()) {
-      fs->DeleteFile(fname, fopt.io_options, &dbg_ctx);
+      fs->DeleteFile(src_fname, fopt.io_options, &dbg_ctx);
       return ios;
     }
   } else {
@@ -1951,12 +1946,13 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
   }
   fs_file->SetPreallocationBlockSize(0);
   double t1 = clock->NowMicros();
-  WritableFileWriter writer(std::move(fs_file), fname, fopt, ioptions.clock,
+  WritableFileWriter writer(std::move(fs_file), is_file_mmap ? src_fname : fname,
+                            fopt, ioptions.clock,
                             nullptr, ioptions.statistics.get(),
                             ioptions.listeners);
   auto fail_after_open = [&](const Status& err) {
     writer.Close();
-    fs->DeleteFile(fname, fopt.io_options, &dbg_ctx);
+    fs->DeleteFile(writer.file_name(), fopt.io_options, &dbg_ctx);
     return err;
   };
   if (is_file_mmap) {
@@ -2061,9 +2057,6 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
   double t6 = clock->NowMicros();
   writer.Close();
   double t7 = clock->NowMicros();
-  if (is_file_mmap) {
-    has_converted_to_sst_ = true;
-  }
   double fsize_mb = meta->fd.file_size / double(1 << 20);
   ROCKS_LOG_INFO(log_,
                  "OffsetSkipListRep::ConvertToSST(%s): fsize = %8.3f M, "
@@ -2073,6 +2066,16 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
                  is_file_mmap ? "seek" : "write", (t2 - t1) / 1e3,
                  (t3 - t2) / 1e3, (t4 - t3) / 1e3, (t5 - t4) / 1e3,
                  (t6 - t5) / 1e3, (t7 - t6) / 1e3, (t7 - t0) / 1e3);
+  if (is_file_mmap) {
+    // Keep the leftover filename until conversion is complete.
+    IOStatus ios = fs->RenameFile(src_fname, fname, fopt.io_options, &dbg_ctx);
+    if (!ios.ok()) {
+      ROCKS_LOG_ERROR(log_, "rename(%s, %s) = %s", src_fname.c_str(),
+                      fname.c_str(), ios.ToString().c_str());
+      return ios;
+    }
+    has_converted_to_sst_ = true;
+  }
   return s;
 } catch (const std::exception& ex) {
   return Status::Aborted(ex.what());

@@ -338,7 +338,7 @@ class OffsetSkipListRep : public MemTableRep {
         return {value, inline_val_len};
       }
       ROCKSDB_ASSERT_LT(wal_idx, tab->num_wals_);
-      auto wal = tab->wals_[wal_idx].wal;
+      auto wal = tab->walmaps_[wal_idx];
       return {wal->data_ + val_pos, val_len};
     }
   };
@@ -359,7 +359,7 @@ class OffsetSkipListRep : public MemTableRep {
         return {value, inline_val_len};
       }
       ROCKSDB_ASSERT_LT(wal_idx, tab->num_wals_);
-      auto wal = tab->wals_[wal_idx].wal;
+      auto wal = tab->walmaps_[wal_idx];
       return GetLengthPrefixedSlice(wal->data_ + val_pos);
     }
   };
@@ -378,12 +378,7 @@ class OffsetSkipListRep : public MemTableRep {
     return 0;
   }
 
-  struct LogFileLookup {
-    uint64_t fileno = 0;
-    uint64_t cnt = 0;
-    uint64_t bytes = 0;
-    const ReadonlyFileMmap* wal = nullptr;
-  };
+  using LogFileLookup = OSLRepHeader::WalSlot;
   static constexpr size_t MAX_WALS = 16;
   static_assert(MAX_WALS == OSLRepHeader::kMaxWals);
 
@@ -398,7 +393,8 @@ class OffsetSkipListRep : public MemTableRep {
   OSLLogRefFormat ref_to_wal_ = OSLLogRefFormat::kNoLogRef;
   bool token_use_idle_ = true;
   size_t num_wals_ = 0;
-  LogFileLookup wals_[MAX_WALS] = {};
+  LogFileLookup* wals_ = nullptr;
+  const ReadonlyFileMmap* walmaps_[MAX_WALS] = {};
   std::mutex wal_mtx_;
 
   size_t add_wal(size_t fileno, const ReadonlyFileMmap* wal) {
@@ -406,7 +402,7 @@ class OffsetSkipListRep : public MemTableRep {
     size_t i = 0;
     while (i < num_wals_) {
       if (LIKELY(wals_[i].fileno == fileno)) {
-        TERARK_ASSERT_EQ(wals_[i].wal, wal);
+        TERARK_ASSERT_EQ(walmaps_[i], wal);
         return i;
       }
       i++;
@@ -414,21 +410,20 @@ class OffsetSkipListRep : public MemTableRep {
     std::lock_guard<std::mutex> lk(wal_mtx_);
     while (i < num_wals_) {
       if (wals_[i].fileno == fileno) {
-        TERARK_VERIFY_EQ(wals_[i].wal, wal);
+        TERARK_VERIFY_EQ(walmaps_[i], wal);
         return i;
       }
       i++;
     }
     TERARK_VERIFY_LT(num_wals_, MAX_WALS);
     wals_[i].cnt = 0;
-    wals_[i].wal = wal;
+    walmaps_[i] = wal;
     wals_[i].bytes = 0;
     wals_[i].fileno = fileno;
     as_atomic(num_wals_).fetch_add(1);
     intrusive_ptr_add_ref(const_cast<ReadonlyFileMmap*>(wal));
     if (auto* h = sl_mmap_header()) {
       auto* rh = RepHdr(h);
-      rh->wals[i].fileno = fileno;
       // A process can crash inside the critical section, before mutex unlock.
       // Only compiler reordering needs to be prevented here, but there is no
       // corresponding standard way to express this, so use the stronger
@@ -525,9 +520,8 @@ class OffsetSkipListRep : public MemTableRep {
   Status ConvertToSST(FileMetaData*, const TableBuilderOptions&) final;
 
   ~OffsetSkipListRep() override {
-    for (size_t i = 0; i < num_wals_; ++i) {
-      auto wal = wals_[i].wal;
-      intrusive_ptr_release(const_cast<ReadonlyFileMmap*>(wal));
+    if (convert_to_sst_ != OSLConvertKind::kFileMmap) {
+      delete[] wals_;
     }
   }
 };
@@ -598,6 +592,13 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
                    OSLTypedefName<SliceCmp>::value) {}
 
   ~OffsetSkipListRepT() override {
+    FlushAllWalTls();
+    for (size_t i = 0; i < num_wals_; ++i) {
+      if (auto* wal = walmaps_[i]) {
+        intrusive_ptr_release(const_cast<ReadonlyFileMmap*>(wal));
+      }
+    }
+    num_wals_ = 0;  // skip_list_ destroys TLS tokens and unmaps the header next.
     if (convert_to_sst_ == OSLConvertKind::kFileMmap &&
         !has_converted_to_sst_ && !skip_list_.mmap_fpath().empty()) {
       ::remove(skip_list_.mmap_fpath().c_str());
@@ -1806,6 +1807,9 @@ void OffsetSkipListRep::InitSetMemTableAsLogIndex(bool b) {
     h->k_max_height = static_cast<uint8_t>(sl_k_max_height());
     h->k_branching = static_cast<uint8_t>(sl_k_branching());
     RepHdr(h)->log_ref = static_cast<uint32_t>(ref_to_wal_);
+    wals_ = RepHdr(h)->wals;
+  } else if (b) {
+    wals_ = new LogFileLookup[MAX_WALS]{};
   }
 }
 
@@ -1863,27 +1867,9 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
     tab.max_visible_seq_ = meta->fd.largest_seqno;
     tab.ref_to_wal_ = static_cast<OSLLogRefFormat>(RepHdr(hdr)->log_ref);
     tab.BindFactoryTokenOpts();
-    const auto* rh = RepHdr(hdr);
-    const uint32_t nwal =
-        as_atomic(rh->num_wals).load(std::memory_order_acquire);
-    FileSystem* fs = tboptions.ioptions.fs.get();
-    for (uint32_t i = 0; i < nwal; ++i) {
-      const std::string walname =
-          LogFileName(tboptions.ioptions.GetWalDir(), rh->wals[i].fileno);
-      boost::intrusive_ptr<ReadonlyFileMmap> fmap;
-      IOStatus ios =
-          ReadonlyFileMmap::New(&fmap, *fs, rh->wals[i].fileno, walname);
-      if (!ios.ok()) {
-        return Status::Corruption(leftover_path, "cannot rebind WAL " + walname);
-      }
-      tab.wals_[i].fileno = rh->wals[i].fileno;
-      // TLS value counts are unavailable; retain each WAL as one whole blob.
-      tab.wals_[i].cnt = 1;
-      tab.wals_[i].bytes = fmap->size();
-      tab.wals_[i].wal = fmap.get();
-      tab.num_wals_++;
-      intrusive_ptr_add_ref(fmap.get());
-    }
+    auto* rh = RepHdr(hdr);
+    tab.wals_ = rh->wals;
+    tab.num_wals_ = as_atomic(rh->num_wals).load(std::memory_order_acquire);
     Status s = tab.ConvertToSST(meta, tboptions);
     TEST_SYNC_POINT_CALLBACK("CrashSafeRecover::ConvertToSST:InjectStatus", &s);
     TEST_SYNC_POINT("CrashSafeRecover::AfterRenameBeforeAddFile");
@@ -2006,7 +1992,9 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
           return fail_after_open(ios);
         }
         oss | blob_no | ":" | e.fileno | ":" | e.cnt | ":" | e.bytes | ",";
-        tbo.add_blob_file({blob_no, e.cnt, e.bytes, "", ""});
+        auto cnt = std::max<uint64_t>(e.cnt, 1);  // TLS counts can lag after a crash.
+        auto bytes = std::max<uint64_t>(e.bytes, 1);  // Keep a positive blob size.
+        tbo.add_blob_file({blob_no, cnt, bytes, "", ""});
         terark::minimize(meta->oldest_blob_file_number, blob_no);
       }
       oss.pop_back();
@@ -2242,12 +2230,13 @@ class OffsetSkipListTableReader : public TopTableReaderBase {
       size_t sum_ref_cnt = 0, sum_ref_size = 0, sum_file_size = 0;
       for (size_t i = 0; i < memtab_->num_wals_; i++) {
         auto& e = memtab_->wals_[i];
+        auto* wal = memtab_->walmaps_[i];
         sum_ref_cnt += e.cnt;
         sum_ref_size += e.bytes;
-        size_t wal_file_size = e.wal ? e.wal->size() : 0;
+        size_t wal_file_size = wal ? wal->size() : 0;
         sum_file_size += wal_file_size;
         json blobjs;
-        blobjs["blob_file"] = e.wal ? e.wal->fileno : 0;
+        blobjs["blob_file"] = wal ? wal->fileno : 0;
         blobjs["wal_file"] = e.fileno;
         blobjs["ref_cnt"] = e.cnt;
         blobjs["ref_size"] = SizeToString(e.bytes);
@@ -2317,6 +2306,7 @@ OffsetSkipListTableReader::OffsetSkipListTableReader(
     }
   }
   if (Slice(compression_options).starts_with("LogRef:")) {
+    memtab_->wals_ = new OffsetSkipListRep::LogFileLookup[OffsetSkipListRep::MAX_WALS]{};
     const char* item = strchr(compression_options.c_str(), ';');
     ROCKSDB_VERIFY(item != nullptr);
     const fstring name(compression_options.c_str(), item);
@@ -2340,6 +2330,7 @@ OffsetSkipListTableReader::OffsetSkipListTableReader(
         THROW_STD(logic_error, "must be blob_no:wal_no:cnt:bytes, but is: %s",
                   item);
       }
+      TERARK_VERIFY_LT(i, OffsetSkipListRep::MAX_WALS);
       auto fpath = BlobFileName(tro.ioptions.cf_paths[0].path, blob_no);
       auto [fmap, ios] =
           ReadonlyFileMmap::New(*tro.ioptions.fs, blob_no, fpath);
@@ -2347,7 +2338,7 @@ OffsetSkipListTableReader::OffsetSkipListTableReader(
                       ios.ToString());
       memtab_->wals_[i].fileno = wal_no;
       memtab_->wals_[i].cnt = cnt;
-      memtab_->wals_[i].wal = fmap.get();
+      memtab_->walmaps_[i] = fmap.get();
       memtab_->wals_[i].bytes = bytes;
       memtab_->num_wals_++;
       TERARK_VERIFY_LE(memtab_->num_wals_, OffsetSkipListRep::MAX_WALS);

@@ -7,6 +7,7 @@
 #include <mutex>
 #include <numeric>
 #include <set>
+#include <stdexcept>
 #include <type_traits>
 #include <terark/offset_skiplist.hpp>
 #include <thread>
@@ -1057,7 +1058,7 @@ TEST_F(OffsetSkipTest, AttachHeadLocBelowPrefixDies) {
   char buf[256] = {};
   terark::fstring mem(buf, sizeof(buf));
   ASSERT_DEATH(
-      { TestOffsetSkipList bad(cmp, mem, 0, 14, 4, 0); },
+      { TestOffsetSkipList bad(cmp, mem, 0, 14, 4, 0, 0); },
       "");
 }
 
@@ -1066,7 +1067,8 @@ std::shared_ptr<MemTableRepFactory> EasyNewMemTableRep(Slice class_name,
 TableFactory* EasyNewTableFactory(Slice class_name, Slice params);
 
 static MemTable* NewOffsetMemTable(Options* options, WriteBufferManager* wb,
-                                   const std::string& js) {
+                                   const std::string& js,
+                                   uint64_t backing_file_number = 0) {
   options->memtable_factory = EasyNewMemTableRep("OffsetSkipList", js);
   if (options->cf_paths.empty()) {
     options->cf_paths.emplace_back(test::TmpDir(), 0);
@@ -1074,7 +1076,7 @@ static MemTable* NewOffsetMemTable(Options* options, WriteBufferManager* wb,
   InternalKeyComparator cmp(options->comparator);
   ImmutableOptions ioptions(*options);
   return new MemTable(cmp, ioptions, MutableCFOptions(*options), wb,
-                      kMaxSequenceNumber, 0);
+                      kMaxSequenceNumber, 0, backing_file_number);
 }
 
 static bool MemGet(MemTable* mem, const Slice& ukey, SequenceNumber snap,
@@ -2027,7 +2029,7 @@ TEST(OffsetSkipRepTest, ConvertToSST_DumpMem) {
   IntTblPropCollectorFactories collectors;
   TableBuilderOptions tbo(ioptions, moptions, icmp, &collectors,
                           options.compression, options.compression_opts, 0,
-                          "default", 0);
+                          kDefaultColumnFamilyName, 0);
   FileMetaData meta;
   meta.fd = FileDescriptor(1, 0, 0);
   meta.num_entries = 3;
@@ -2117,7 +2119,7 @@ TEST(OffsetSkipRepTest, ConvertToSST_ReverseBytewise) {
   IntTblPropCollectorFactories collectors;
   TableBuilderOptions tbo(ioptions, moptions, icmp, &collectors,
                           options.compression, options.compression_opts, 0,
-                          "default", 0);
+                          kDefaultColumnFamilyName, 0);
   FileMetaData meta;
   meta.fd = FileDescriptor(1, 0, 0);
   meta.num_entries = 3;
@@ -2183,7 +2185,7 @@ TEST(OffsetSkipRepTest, ConvertToSST_Empty) {
   IntTblPropCollectorFactories collectors;
   TableBuilderOptions tbo(ioptions, moptions, icmp, &collectors,
                           options.compression, options.compression_opts, 0,
-                          "default", 0);
+                          kDefaultColumnFamilyName, 0);
   FileMetaData meta;
   meta.fd = FileDescriptor(1, 0, 0);
   mem->MarkImmutable();
@@ -2193,9 +2195,13 @@ TEST(OffsetSkipRepTest, ConvertToSST_Empty) {
 
 TEST(OffsetSkipRepTest, ConvertToSST_FileMmap) {
   Options options;
+  const std::string dir = test::PerThreadDBPath("osl_convert_mmap");
+  ASSERT_OK(Env::Default()->CreateDirIfMissing(dir));
+  options.cf_paths = {{dir, 0}};
+  Env::Default()->DeleteFile(MakeTableFileName(dir, 1)).PermitUncheckedError();
   WriteBufferManager wb(options.db_write_buffer_size);
   std::unique_ptr<MemTable> mem(NewOffsetMemTable(
-      &options, &wb, R"({"mem_cap":16777216,"convert_to_sst":"kFileMmap"})"));
+      &options, &wb, R"({"mem_cap":16777216,"convert_to_sst":"kFileMmap"})", 1));
   ASSERT_TRUE(mem->SupportConvertToSST());
   ASSERT_OK(mem->Add(1, kTypeValue, "key1", "v1", nullptr));
   ASSERT_OK(mem->Add(2, kTypeValue, "key2", "v2", nullptr));
@@ -2207,7 +2213,7 @@ TEST(OffsetSkipRepTest, ConvertToSST_FileMmap) {
   IntTblPropCollectorFactories collectors;
   TableBuilderOptions tbo(ioptions, moptions, icmp, &collectors,
                           options.compression, options.compression_opts, 0,
-                          "default", 0);
+                          kDefaultColumnFamilyName, 0);
   FileMetaData meta;
   meta.fd = FileDescriptor(1, 0, 0);
   meta.num_entries = 3;
@@ -2332,7 +2338,7 @@ TEST(OffsetSkipRepTest, LogRef_ConvertToSST_Reopen) {
   IntTblPropCollectorFactories collectors;
   TableBuilderOptions tbo(ioptions, moptions, icmp, &collectors,
                           options.compression, options.compression_opts, 0,
-                          "default", 0);
+                          kDefaultColumnFamilyName, 0);
   uint64_t next_blob = 7;
   std::vector<BlobFileAddition> blobs;
   tbo.generate_file_no = [&]() { return next_blob++; };
@@ -2525,7 +2531,7 @@ TEST(OffsetSkipRepTest, ConvertToSST_MultiVersion) {
   IntTblPropCollectorFactories collectors;
   TableBuilderOptions tbo(ioptions, moptions, icmp, &collectors,
                           options.compression, options.compression_opts, 0,
-                          "default", 0);
+                          kDefaultColumnFamilyName, 0);
   FileMetaData meta;
   meta.fd = FileDescriptor(1, 0, 0);
   meta.num_entries = 4;
@@ -2613,7 +2619,7 @@ TEST(OffsetSkipRepTest, LogRef_InlineNoBlob) {
   IntTblPropCollectorFactories collectors;
   TableBuilderOptions tbo(ioptions, moptions, icmp, &collectors,
                           options.compression, options.compression_opts, 0,
-                          "default", 0);
+                          kDefaultColumnFamilyName, 0);
   std::vector<BlobFileAddition> blobs;
   tbo.generate_file_no = []() { return uint64_t{1}; };
   tbo.add_blob_file = [&](BlobFileAddition b) {
@@ -2706,7 +2712,7 @@ TEST(OffsetSkipRepTest, LogRef_PlainAndSameKey) {
   IntTblPropCollectorFactories collectors;
   TableBuilderOptions tbo(ioptions, moptions, icmp, &collectors,
                           options.compression, options.compression_opts, 0,
-                          "default", 0);
+                          kDefaultColumnFamilyName, 0);
   uint64_t next_blob = 9;
   std::vector<BlobFileAddition> blobs;
   tbo.generate_file_no = [&]() { return next_blob++; };
@@ -2762,14 +2768,12 @@ TEST(OffsetSkipRepTest, FileMmapHeaderAtOffsetZero) {
   options.cf_paths = {{dir, 0}};
   WriteBufferManager wb(options.db_write_buffer_size);
   std::unique_ptr<MemTable> mem(NewOffsetMemTable(
-      &options, &wb, R"({"mem_cap":16777216,"convert_to_sst":"kFileMmap"})"));
+      &options, &wb, R"({"mem_cap":16777216,"convert_to_sst":"kFileMmap"})", 1));
   ASSERT_TRUE(mem->SupportConvertToSST());
   ASSERT_OK(mem->Add(1, kTypeValue, "k", "v", nullptr));
 
-  std::vector<std::string> leftovers;
-  options.memtable_factory->ListCrashSafeLeftovers(dir, &leftovers);
-  ASSERT_FALSE(leftovers.empty());
-  int fd = ::open(leftovers[0].c_str(), O_RDONLY);
+  const std::string path = MakeTableFileName(dir, 1);
+  int fd = ::open(path.c_str(), O_RDONLY);
   ASSERT_GE(fd, 0);
   terark::OSL_MmapHeader hdr{};
   ASSERT_EQ(::pread(fd, &hdr, sizeof(hdr), 0),
@@ -2778,7 +2782,6 @@ TEST(OffsetSkipRepTest, FileMmapHeaderAtOffsetZero) {
   ASSERT_STREQ(hdr.magic, terark::kOSLMmapHeaderMagic);
   ASSERT_NE(hdr.head_loc, 0U);
   ASSERT_GE(hdr.mem_used, 512U);
-  ASSERT_OK(options.memtable_factory->ProbeCrashSafeLeftover(leftovers[0], dir));
 }
 
 TEST(OffsetSkipRepTest, CreateMemTableRepDoesNotOverwriteLeftover) {
@@ -2788,20 +2791,15 @@ TEST(OffsetSkipRepTest, CreateMemTableRepDoesNotOverwriteLeftover) {
   options.cf_paths = {{dir, 0}};
   WriteBufferManager wb(options.db_write_buffer_size);
   std::unique_ptr<MemTable> mem(NewOffsetMemTable(
-      &options, &wb, R"({"mem_cap":16777216,"convert_to_sst":"kFileMmap"})"));
+      &options, &wb, R"({"mem_cap":16777216,"convert_to_sst":"kFileMmap"})", 1));
   ASSERT_OK(mem->Add(1, kTypeValue, "keep", "me", nullptr));
-  std::vector<std::string> leftovers;
-  options.memtable_factory->ListCrashSafeLeftovers(dir, &leftovers);
-  ASSERT_EQ(leftovers.size(), 1U);
-  const std::string first_path = leftovers[0];
+  const std::string first_path = MakeTableFileName(dir, 1);
   std::string before;
   ASSERT_OK(ReadFileToString(Env::Default(), first_path, &before));
-  std::unique_ptr<MemTable> mem2(NewOffsetMemTable(
-      &options, &wb, R"({"mem_cap":16777216,"convert_to_sst":"kFileMmap"})"));
-  ASSERT_OK(mem2->Add(2, kTypeValue, "other", "x", nullptr));
-  leftovers.clear();
-  options.memtable_factory->ListCrashSafeLeftovers(dir, &leftovers);
-  ASSERT_GE(leftovers.size(), 2U);
+  ASSERT_THROW({
+    std::unique_ptr<MemTable> collision(NewOffsetMemTable(
+        &options, &wb, R"({"mem_cap":16777216,"convert_to_sst":"kFileMmap"})", 1));
+  }, std::runtime_error);
   std::string after;
   ASSERT_OK(ReadFileToString(Env::Default(), first_path, &after));
   ASSERT_EQ(before, after);

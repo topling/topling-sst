@@ -44,12 +44,12 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 #include <thread>
 #include <type_traits>
 #include <utility>
 
 #ifndef _MSC_VER
-#include <dirent.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -389,6 +389,7 @@ class OffsetSkipListRep : public MemTableRep {
   Logger* log_;
   OSLConvertKind convert_to_sst_ = OSLConvertKind::kDontConvert;
   bool has_converted_to_sst_ = false;
+  bool file_registered_ = false;
   SequenceNumber max_visible_seq_ = kMaxSequenceNumber;
   OSLLogRefFormat ref_to_wal_ = OSLLogRefFormat::kNoLogRef;
   bool token_use_idle_ = true;
@@ -518,6 +519,10 @@ class OffsetSkipListRep : public MemTableRep {
     return convert_to_sst_ != OSLConvertKind::kDontConvert;
   }
   Status ConvertToSST(FileMetaData*, const TableBuilderOptions&) final;
+  void MarkFileRegistered() final { file_registered_ = true; }
+  bool IsFileMmap() const final {
+    return convert_to_sst_ == OSLConvertKind::kFileMmap;
+  }
 
   ~OffsetSkipListRep() override {
     if (convert_to_sst_ != OSLConvertKind::kFileMmap) {
@@ -600,7 +605,8 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     }
     num_wals_ = 0;  // skip_list_ destroys TLS tokens and unmaps the header next.
     if (convert_to_sst_ == OSLConvertKind::kFileMmap &&
-        !has_converted_to_sst_ && !skip_list_.mmap_fpath().empty()) {
+        !has_converted_to_sst_ && !file_registered_ &&
+        !skip_list_.mmap_fpath().empty()) {
       ::remove(skip_list_.mmap_fpath().c_str());
     }
   }
@@ -1626,7 +1632,6 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
   bool sync_sst_file = true;
   bool allow_dangerous_update = false;
   std::string chroot_dir;
-  std::atomic<size_t> cumu_num{0};
 
   OffsetSkipListFactory(const json& js, const SidePluginRepo& r) {
     ROCKSDB_JSON_OPT_PROP(js, chroot_dir);
@@ -1645,31 +1650,35 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
                                  Logger* logger, uint32_t cf_id) final {
     return CreateMemTableRep("", MutableCFOptions(), cmp, a, s, logger, cf_id);
   }
-  MemTableRep* CreateMemTableRep(const std::string& level0_dir,
+  MemTableRep* CreateMemTableRep(const std::string& memtable_file_path,
                                  const MutableCFOptions& mcfopt,
                                  const MemTableRep::KeyComparator& cmp,
                                  Allocator* allocator,
                                  const SliceTransform* transform,
-                                 Logger* logger, uint32_t cf_id) final {
+                                 Logger* logger, uint32_t /*cf_id*/) final {
     auto cap = ChooseMemCap(mem_cap, mcfopt.write_buffer_size);
     auto convert = convert_to_sst;
+    if (memtable_file_path.empty() && convert == OSLConvertKind::kFileMmap) {
+      convert = OSLConvertKind::kDumpMem;
+    }
     auto uc = cmp.icomparator()->user_comparator();
     if (convert == OSLConvertKind::kFileMmap) {
-      for (;;) {
-        auto idx = cumu_num.fetch_add(1, std::memory_order_relaxed);
-        terark::string_appender<> path;
-        path | chroot_dir | level0_dir;
-        if (!path.empty() && path.end()[-1] != '/') {
-          path | "/";
-        }
-        path ^ "OffsetSkipList-%06zd.memtab-" ^ idx ^ cf_id;
-        if (::access(path.c_str(), F_OK) != 0) {
-          auto* r = NewOSLRep(uc, allocator, transform, lookahead, cap, this,
-                              logger, convert, path.str());
-          r->BindFactoryTokenOpts();
-          return r;
-        }
+      const std::string path = chroot_dir + memtable_file_path;
+      int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+      if (fd < 0) {
+        throw std::runtime_error("create memtable " + path + ": " + errnoStr(errno).c_str());
       }
+      ::close(fd);
+      OffsetSkipListRep* r;
+      try {
+        r = NewOSLRep(uc, allocator, transform, lookahead, cap, this,
+                      logger, convert, path);
+      } catch (...) {
+        ::unlink(path.c_str());
+        throw;
+      }
+      r->BindFactoryTokenOpts();
+      return r;
     }
     auto* r = NewOSLRep(uc, allocator, transform, lookahead, cap, this, logger,
                         convert);
@@ -1680,66 +1689,11 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
   const char* Name() const final { return "OffsetSkipList"; }
   bool IsInsertConcurrentlySupported() const final { return true; }
   bool CanHandleDuplicatedKey() const final { return true; }
+  bool SupportConvertToSST() const final {
+    return convert_to_sst != OSLConvertKind::kDontConvert;
+  }
   bool SupportCrashSafe() const final {
     return convert_to_sst == OSLConvertKind::kFileMmap;
-  }
-  void ListCrashSafeLeftovers(const std::string& cf_dir,
-                              std::vector<std::string>* leftovers) final {
-    std::string dir = chroot_dir + cf_dir;
-    DIR* d = ::opendir(dir.c_str());
-    if (d == nullptr) {
-      return;
-    }
-    size_t next_num = 0;
-    while (auto* ent = ::readdir(d)) {
-      const char* name = ent->d_name;
-      if (strncmp(name, "OffsetSkipList-", 15) == 0 &&
-          strstr(name, ".memtab-") != nullptr) {
-        leftovers->emplace_back(dir + "/" + name);
-        Slice rest(name + 15);
-        uint64_t num;
-        if (ConsumeDecimalNumber(&rest, &num) && rest.starts_with(".memtab-") &&
-            num < SIZE_MAX) {
-          next_num = std::max(next_num, size_t(num + 1));
-        }
-      }
-    }
-    ::closedir(d);
-    terark::atomic_maximize(reinterpret_cast<size_t&>(cumu_num), next_num);
-  }
-  Status ProbeCrashSafeLeftover(const std::string& leftover_path,
-                                const std::string& wal_dir) const final {
-    int fd = ::open(leftover_path.c_str(), O_RDONLY);
-    if (fd < 0) {
-      return Status::IOError(leftover_path, errnoStr(errno).c_str());
-    }
-    terark::OSL_MmapHeader hdr{};
-    ssize_t n = ::pread(fd, &hdr, sizeof(hdr), 0);
-    struct stat st;
-    const int st_err = ::fstat(fd, &st);
-    ::close(fd);
-    if (st_err != 0) {
-      return Status::IOError(leftover_path, errnoStr(errno).c_str());
-    }
-    if (n != static_cast<ssize_t>(sizeof(hdr))) {
-      return Status::Corruption(leftover_path, "short OSL header");
-    }
-    Status hs = CheckOSLMmapHeader(hdr, static_cast<uint64_t>(st.st_size),
-                                   leftover_path);
-    if (!hs.ok()) {
-      return hs;
-    }
-    const auto* rh = RepHdr(&hdr);
-    const uint32_t nwal =
-        as_atomic(rh->num_wals).load(std::memory_order_acquire);
-    for (uint32_t i = 0; i < nwal; ++i) {
-      const std::string walname = LogFileName(wal_dir, rh->wals[i].fileno);
-      if (::access(walname.c_str(), F_OK) != 0) {
-        return Status::Corruption(leftover_path,
-                                  "cannot rebind WAL " + walname);
-      }
-    }
-    return Status::OK();
   }
   Status RecoverCrashSafeMemTableToSST(
       const std::string& leftover_path, FileMetaData* meta,
@@ -1814,8 +1768,9 @@ void OffsetSkipListRep::InitSetMemTableAsLogIndex(bool b) {
 }
 
 Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
-    const std::string& leftover_path, FileMetaData* meta,
+    const std::string& logical_path, FileMetaData* meta,
     const TableBuilderOptions& tboptions) {
+  const std::string leftover_path = chroot_dir + logical_path;
   int fd = ::open(leftover_path.c_str(), O_RDWR);
   if (fd < 0) {
     return Status::IOError(leftover_path, errnoStr(errno).c_str());
@@ -1843,19 +1798,7 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
     ::close(fd);
     return hs;
   }
-  Status trunc_s;
-  TEST_SYNC_POINT_CALLBACK("CrashSafeRecover::Truncate:InjectStatus", &trunc_s);
-  if (!trunc_s.ok()) {
-    ::munmap(p, size_t(st.st_size));
-    ::close(fd);
-    return trunc_s;
-  }
   const size_t used = static_cast<size_t>(hdr->mem_used);
-  if (::ftruncate(fd, static_cast<off_t>(used)) != 0) {
-    ::munmap(p, size_t(st.st_size));
-    ::close(fd);
-    return Status::IOError(leftover_path, errnoStr(errno).c_str());
-  }
   const Comparator* uc = tboptions.internal_comparator.user_comparator();
   auto recover = [&](auto cmp) -> Status {
     using Rep = OffsetSkipListRepT<decltype(cmp)>;
@@ -1864,6 +1807,7 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
             tboptions.ioptions.logger);
     tab.sl_risk_bind_mmap(fd, leftover_path, size_t(st.st_size));
     tab.convert_to_sst_ = OSLConvertKind::kFileMmap;
+    tab.MarkFileRegistered();
     tab.max_visible_seq_ = meta->fd.largest_seqno;
     tab.ref_to_wal_ = static_cast<OSLLogRefFormat>(RepHdr(hdr)->log_ref);
     tab.BindFactoryTokenOpts();
@@ -1872,7 +1816,7 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
     tab.num_wals_ = as_atomic(rh->num_wals).load(std::memory_order_acquire);
     Status s = tab.ConvertToSST(meta, tboptions);
     TEST_SYNC_POINT_CALLBACK("CrashSafeRecover::ConvertToSST:InjectStatus", &s);
-    TEST_SYNC_POINT("CrashSafeRecover::AfterRenameBeforeAddFile");
+    TEST_SYNC_POINT("CrashSafeRecover::AfterConvertBeforeAddFile");
     return s;
   };
   if (uc->IsForwardBytewise()) {
@@ -1888,6 +1832,7 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
 
 Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
                                        const TableBuilderOptions& tbo) try {
+  TEST_SYNC_POINT("MemTableRep::ConvertToSST:Before");
   FlushAllWalTls();
   MemGC();
   auto& ioptions = tbo.ioptions;
@@ -1909,19 +1854,28 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
                                     meta->fd.GetPathId());
   std::unique_ptr<FSWritableFile> fs_file;
   const bool is_file_mmap = convert_to_sst_ == OSLConvertKind::kFileMmap;
-  std::string src_fname;
   double t0 = clock->NowMicros();
   OffsetSkipListMeta sst_meta;
   FillMeta(&sst_meta);
   if (is_file_mmap) {
     sl_set_readonly();
-    src_fname = sl_mmap_fpath();
+    std::string src_fname = sl_mmap_fpath();
     size_t chroot_len = fac_->chroot_dir.size();
     TERARK_VERIFY_S_EQ(fstring(src_fname).prefix(chroot_len), fac_->chroot_dir);
     src_fname.erase(0, chroot_len);
+    if (src_fname != fname) {
+      return Status::InvalidArgument("memtable backing path differs from SST path", src_fname);
+    }
     IOStatus ios = fs->ReopenWritableFile(src_fname, fopt, &fs_file, &dbg_ctx);
     if (!ios.ok()) {
-      fs->DeleteFile(src_fname, fopt.io_options, &dbg_ctx);
+      if (!file_registered_) fs->DeleteFile(src_fname, fopt.io_options, &dbg_ctx);
+      return ios;
+    }
+    // Readonly conversion is idempotent and does not truncate a prior footer.
+    // Rebuild the tail after a failed conversion or MANIFEST commit.
+    ios = fs_file->Truncate(sl_get_mmap().size(), fopt.io_options, &dbg_ctx);
+    TEST_SYNC_POINT_CALLBACK("MemTableRep::ConvertToSST:Truncate", &ios);
+    if (!ios.ok()) {
       return ios;
     }
   } else {
@@ -1932,13 +1886,14 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
   }
   fs_file->SetPreallocationBlockSize(0);
   double t1 = clock->NowMicros();
-  WritableFileWriter writer(std::move(fs_file), is_file_mmap ? src_fname : fname,
-                            fopt, ioptions.clock,
+  WritableFileWriter writer(std::move(fs_file), fname, fopt, ioptions.clock,
                             nullptr, ioptions.statistics.get(),
                             ioptions.listeners);
   auto fail_after_open = [&](const Status& err) {
     writer.Close();
-    fs->DeleteFile(writer.file_name(), fopt.io_options, &dbg_ctx);
+    if (!is_file_mmap || !file_registered_) {
+      fs->DeleteFile(writer.file_name(), fopt.io_options, &dbg_ctx);
+    }
     return err;
   };
   if (is_file_mmap) {
@@ -2054,16 +2009,8 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
                  is_file_mmap ? "seek" : "write", (t2 - t1) / 1e3,
                  (t3 - t2) / 1e3, (t4 - t3) / 1e3, (t5 - t4) / 1e3,
                  (t6 - t5) / 1e3, (t7 - t6) / 1e3, (t7 - t0) / 1e3);
-  if (is_file_mmap) {
-    // Keep the leftover filename until conversion is complete.
-    IOStatus ios = fs->RenameFile(src_fname, fname, fopt.io_options, &dbg_ctx);
-    if (!ios.ok()) {
-      ROCKS_LOG_ERROR(log_, "rename(%s, %s) = %s", src_fname.c_str(),
-                      fname.c_str(), ios.ToString().c_str());
-      return ios;
-    }
-    has_converted_to_sst_ = true;
-  }
+  has_converted_to_sst_ = true;
+  TEST_SYNC_POINT("MemTableRep::ConvertToSST:After");
   return s;
 } catch (const std::exception& ex) {
   return Status::Aborted(ex.what());

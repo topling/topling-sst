@@ -1630,12 +1630,10 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
   bool token_use_idle = true;
   bool enable_gc = true;
   bool sync_sst_file = true;
-  bool allow_dangerous_update = false;
   std::string chroot_dir;
 
   OffsetSkipListFactory(const json& js, const SidePluginRepo& r) {
     ROCKSDB_JSON_OPT_PROP(js, chroot_dir);
-    ROCKSDB_JSON_OPT_PROP(js, allow_dangerous_update); // immutable
     ROCKSDB_JSON_OPT_ENUM(js, convert_to_sst); // initial mode is unrestricted
     Update({}, js, r);
   }
@@ -1700,16 +1698,11 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
       const TableBuilderOptions& tboptions) final;
 
   void Update(const json&, const json& js, const SidePluginRepo&) {
-    bool allow_dangerous_update = this->allow_dangerous_update;
-    ROCKSDB_JSON_OPT_PROP(js, allow_dangerous_update);
-    if (allow_dangerous_update != this->allow_dangerous_update) {
-      THROW_InvalidArgument("allow_dangerous_update cannot be changed online");
-    }
     auto convert_to_sst = this->convert_to_sst;
     ROCKSDB_JSON_OPT_ENUM(js, convert_to_sst);
-    if (convert_to_sst != this->convert_to_sst && !allow_dangerous_update) {
+    if (convert_to_sst != this->convert_to_sst) {
       THROW_InvalidArgument(
-          "changing convert_to_sst online requires allow_dangerous_update=true");
+          "convert_to_sst cannot be changed online");
     }
     ROCKSDB_JSON_OPT_PROP(js, lookahead);
     ROCKSDB_JSON_OPT_SIZE(js, mem_cap);
@@ -1717,11 +1710,6 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
     ROCKSDB_JSON_OPT_PROP(js, token_use_idle);
     ROCKSDB_JSON_OPT_PROP(js, enable_gc);
     ROCKSDB_JSON_OPT_PROP(js, sync_sst_file);
-    if (convert_to_sst != this->convert_to_sst) {
-      fprintf(stderr, "WARN: %s: changing convert_to_sst online may invalidate "
-                      "crash-safe recovery\n", Name());
-      this->convert_to_sst = convert_to_sst;
-    }
   }
   std::string ToString(const json& d, const SidePluginRepo&) const {
     return JsonToString(ToJson(d), d);
@@ -1732,7 +1720,6 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
   json ToJson(const json& d) const { return ToJson(d, true); }
   json ToJson(const json& /*d*/, bool /*live_status*/) const {
     json djs;
-    ROCKSDB_JSON_SET_PROP(djs, allow_dangerous_update);
     ROCKSDB_JSON_SET_PROP(djs, lookahead);
     ROCKSDB_JSON_SET_SIZE(djs, mem_cap);
     ROCKSDB_JSON_SET_ENUM(djs, log_ref_format);

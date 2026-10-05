@@ -88,7 +88,7 @@
 
 namespace rocksdb {
 
-ROCKSDB_ENUM_CLASS(OSLConvertKind, uint8_t, kDontConvert, kDumpMem, kFileMmap);
+using ConvertKind = MemTableRep::ConvertKind;
 ROCKSDB_ENUM_CLASS(OSLLogRefFormat, uint8_t, kNoLogRef, kPlainLogRef,
                    kShortLogRef);
 static const uint64_t kOSLMemTabMagic = 0x62546d654d4c534fULL;  // OSLMemTb
@@ -296,15 +296,15 @@ class OffsetSkipListRep : public MemTableRep {
  protected:
   OffsetSkipListRep(Allocator* allocator, const Comparator* ucmp,
                     const SliceTransform* transform, size_t lookahead,
-                    OffsetSkipListFactory* fac, Logger* log,
-                    OSLConvertKind convert)
+                    OffsetSkipListFactory* fac, Logger* log, ConvertKind convert)
       : MemTableRep(allocator),
         ucmp_(ucmp),
         transform_(transform),
         lookahead_(lookahead),
         fac_(fac),
-        log_(log),
-        convert_to_sst_(convert) {}
+        log_(log) {
+    m_convert_to_sst = convert;
+  }
 
  public:
 #pragma pack(push, 4)
@@ -387,7 +387,6 @@ class OffsetSkipListRep : public MemTableRep {
   const size_t lookahead_;
   OffsetSkipListFactory* fac_;
   Logger* log_;
-  OSLConvertKind convert_to_sst_ = OSLConvertKind::kDontConvert;
   bool has_converted_to_sst_ = false;
   bool file_registered_ = false;
   SequenceNumber max_visible_seq_ = kMaxSequenceNumber;
@@ -515,20 +514,17 @@ class OffsetSkipListRep : public MemTableRep {
   bool SupportMemTableAsLogIndex() const final {
     return ref_to_wal_ != OSLLogRefFormat::kNoLogRef;
   }
-  bool SupportConvertToSST() const final {
-    return convert_to_sst_ != OSLConvertKind::kDontConvert;
-  }
   Status ConvertToSST(FileMetaData*, const TableBuilderOptions&) final;
   void MarkFileRegistered() final { file_registered_ = true; }
   bool IsFileMmap() const final {
-    return convert_to_sst_ == OSLConvertKind::kFileMmap;
+    return m_convert_to_sst == ConvertKind::kFileMmap;
   }
-
   ~OffsetSkipListRep() override {
-    if (convert_to_sst_ != OSLConvertKind::kFileMmap) {
+    if (m_convert_to_sst != ConvertKind::kFileMmap) {
       delete[] wals_;
     }
   }
+
 };
 
 template <class SliceCmp>
@@ -582,7 +578,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   OffsetSkipListRepT(const Comparator* ucmp, Allocator* allocator,
                      const SliceTransform* transform, const size_t lookahead,
                      size_t mem_cap, OffsetSkipListFactory* fac, Logger* log,
-                     OSLConvertKind convert)
+                     ConvertKind convert)
       : OffsetSkipListRep(allocator, ucmp, transform, lookahead, fac, log,
                           convert),
         skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem_cap) {}
@@ -590,7 +586,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   OffsetSkipListRepT(const Comparator* ucmp, Allocator* allocator,
                      const SliceTransform* transform, const size_t lookahead,
                      size_t mem_cap, OffsetSkipListFactory* fac, Logger* log,
-                     OSLConvertKind convert, const std::string& mmap_path)
+                     ConvertKind convert, const std::string& mmap_path)
       : OffsetSkipListRep(allocator, ucmp, transform, lookahead, fac, log,
                           convert),
         skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem_cap, mmap_path,
@@ -604,7 +600,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       }
     }
     num_wals_ = 0;  // skip_list_ destroys TLS tokens and unmaps the header next.
-    if (convert_to_sst_ == OSLConvertKind::kFileMmap &&
+    if (m_convert_to_sst == ConvertKind::kFileMmap &&
         !has_converted_to_sst_ && !file_registered_ &&
         !skip_list_.mmap_fpath().empty()) {
       ::remove(skip_list_.mmap_fpath().c_str());
@@ -615,7 +611,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
                      int height_limit, int current_height, int32_t branching,
                      uint64_t num_nodes, OffsetSkipListFactory* fac, Logger* log)
       : OffsetSkipListRep(nullptr, ucmp, nullptr, 0, fac, log,
-                          OSLConvertKind::kDontConvert),
+                          ConvertKind::kDontConvert),
         skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem, head_loc,
                    height_limit, current_height, branching, num_nodes) {}
 
@@ -1626,7 +1622,6 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
   size_t lookahead = 0;
   size_t mem_cap = 2LL << 30;
   OSLLogRefFormat log_ref_format = OSLLogRefFormat::kShortLogRef;
-  OSLConvertKind convert_to_sst = OSLConvertKind::kDontConvert;
   bool token_use_idle = true;
   bool enable_gc = true;
   bool sync_sst_file = true;
@@ -1657,7 +1652,7 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
     auto cap = ChooseMemCap(mem_cap, mcfopt.write_buffer_size);
     auto convert = convert_to_sst;
     auto uc = cmp.icomparator()->user_comparator();
-    if (convert == OSLConvertKind::kFileMmap) {
+    if (convert == ConvertKind::kFileMmap) {
       ROCKSDB_VERIFY(!memtable_file_path.empty());
       const std::string path = chroot_dir + memtable_file_path;
       int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
@@ -1685,12 +1680,6 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
   const char* Name() const final { return "OffsetSkipList"; }
   bool IsInsertConcurrentlySupported() const final { return true; }
   bool CanHandleDuplicatedKey() const final { return true; }
-  bool SupportConvertToSST() const final {
-    return convert_to_sst != OSLConvertKind::kDontConvert;
-  }
-  bool SupportCrashSafe() const final {
-    return convert_to_sst == OSLConvertKind::kFileMmap;
-  }
   Status RecoverCrashSafeMemTableToSST(
       const std::string& leftover_path, FileMetaData* meta,
       const TableBuilderOptions& tboptions) final;
@@ -1791,7 +1780,7 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
             hdr->k_max_height, hdr->max_height, hdr->k_branching, 0, this,
             tboptions.ioptions.logger);
     tab.sl_risk_bind_mmap(fd, leftover_path, size_t(st.st_size));
-    tab.convert_to_sst_ = OSLConvertKind::kFileMmap;
+    tab.m_convert_to_sst = ConvertKind::kFileMmap;
     tab.MarkFileRegistered();
     tab.max_visible_seq_ = meta->fd.largest_seqno;
     tab.ref_to_wal_ = static_cast<OSLLogRefFormat>(RepHdr(hdr)->log_ref);
@@ -1823,7 +1812,7 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
   auto& ioptions = tbo.ioptions;
   auto* clock = ioptions.clock;
   auto* fs = ioptions.fs.get();
-  ROCKSDB_VERIFY_NE(convert_to_sst_, OSLConvertKind::kDontConvert);
+  ROCKSDB_VERIFY_NE(m_convert_to_sst, ConvertKind::kDontConvert);
   {
     std::unique_ptr<MemTableRep::Iterator> probe(GetIterator(nullptr));
     probe->SeekToFirst();
@@ -1838,7 +1827,7 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
   std::string fname = TableFileName(tbo.ioptions.cf_paths, meta->fd.GetNumber(),
                                     meta->fd.GetPathId());
   std::unique_ptr<FSWritableFile> fs_file;
-  const bool is_file_mmap = convert_to_sst_ == OSLConvertKind::kFileMmap;
+  const bool is_file_mmap = m_convert_to_sst == ConvertKind::kFileMmap;
   double t0 = clock->NowMicros();
   OffsetSkipListMeta sst_meta;
   FillMeta(&sst_meta);
@@ -2101,7 +2090,7 @@ class OffsetSkipListTableReader : public TopTableReaderBase {
   std::string ToWebViewString(const json& dump_options) const final {
     json djs;
     auto log_ref_format = memtab_->ref_to_wal_;
-    auto convert_to_sst = memtab_->convert_to_sst_;
+    auto convert_to_sst = memtab_->GetConvertKind();
     auto token_use_idle = memtab_->token_use_idle_;
     auto enable_gc = memtab_->sl_is_gc_enabled();
     auto lookahead = memtab_->lookahead_;

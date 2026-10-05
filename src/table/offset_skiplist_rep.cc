@@ -387,8 +387,6 @@ class OffsetSkipListRep : public MemTableRep {
   const size_t lookahead_;
   OffsetSkipListFactory* fac_;
   Logger* log_;
-  bool has_converted_to_sst_ = false;
-  bool file_registered_ = false;
   SequenceNumber max_visible_seq_ = kMaxSequenceNumber;
   OSLLogRefFormat ref_to_wal_ = OSLLogRefFormat::kNoLogRef;
   bool token_use_idle_ = true;
@@ -515,15 +513,6 @@ class OffsetSkipListRep : public MemTableRep {
     return ref_to_wal_ != OSLLogRefFormat::kNoLogRef;
   }
   Status ConvertToSST(FileMetaData*, const TableBuilderOptions&) final;
-  void MarkFileRegistered() final { file_registered_ = true; }
-  bool IsFileMmap() const final {
-    return m_convert_to_sst == ConvertKind::kFileMmap;
-  }
-  ~OffsetSkipListRep() override {
-    if (m_convert_to_sst != ConvertKind::kFileMmap) {
-      delete[] wals_;
-    }
-  }
 
 };
 
@@ -586,9 +575,9 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   OffsetSkipListRepT(const Comparator* ucmp, Allocator* allocator,
                      const SliceTransform* transform, const size_t lookahead,
                      size_t mem_cap, OffsetSkipListFactory* fac, Logger* log,
-                     ConvertKind convert, const std::string& mmap_path)
+                     const std::string& mmap_path)
       : OffsetSkipListRep(allocator, ucmp, transform, lookahead, fac, log,
-                          convert),
+                          ConvertKind::kFileMmap),
         skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem_cap, mmap_path,
                    OSLTypedefName<SliceCmp>::value) {}
 
@@ -600,10 +589,9 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       }
     }
     num_wals_ = 0;  // skip_list_ destroys TLS tokens and unmaps the header next.
-    if (m_convert_to_sst == ConvertKind::kFileMmap &&
-        !has_converted_to_sst_ && !file_registered_ &&
-        !skip_list_.mmap_fpath().empty()) {
-      ::remove(skip_list_.mmap_fpath().c_str());
+    auto* h = skip_list_.mmap_header();
+    if (!h || wals_ != RepHdr(h)->wals) {
+      delete[] wals_;
     }
   }
 
@@ -611,7 +599,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
                      int height_limit, int current_height, int32_t branching,
                      uint64_t num_nodes, OffsetSkipListFactory* fac, Logger* log)
       : OffsetSkipListRep(nullptr, ucmp, nullptr, 0, fac, log,
-                          ConvertKind::kDontConvert),
+                          ConvertKind::kFileMmap),
         skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem, head_loc,
                    height_limit, current_height, branching, num_nodes) {}
 
@@ -1663,7 +1651,7 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
       OffsetSkipListRep* r;
       try {
         r = NewOSLRep(uc, allocator, transform, lookahead, cap, this,
-                      logger, convert, path);
+                      logger, path);
       } catch (...) {
         ::unlink(path.c_str());
         throw;
@@ -1780,8 +1768,6 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
             hdr->k_max_height, hdr->max_height, hdr->k_branching, 0, this,
             tboptions.ioptions.logger);
     tab.sl_risk_bind_mmap(fd, leftover_path, size_t(st.st_size));
-    tab.m_convert_to_sst = ConvertKind::kFileMmap;
-    tab.MarkFileRegistered();
     tab.max_visible_seq_ = meta->fd.largest_seqno;
     tab.ref_to_wal_ = static_cast<OSLLogRefFormat>(RepHdr(hdr)->log_ref);
     tab.BindFactoryTokenOpts();
@@ -1842,7 +1828,6 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
     }
     IOStatus ios = fs->ReopenWritableFile(src_fname, fopt, &fs_file, &dbg_ctx);
     if (!ios.ok()) {
-      if (!file_registered_) fs->DeleteFile(src_fname, fopt.io_options, &dbg_ctx);
       return ios;
     }
     // Readonly conversion is idempotent and does not truncate a prior footer.
@@ -1865,7 +1850,7 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
                             ioptions.listeners);
   auto fail_after_open = [&](const Status& err) {
     writer.Close();
-    if (!is_file_mmap || !file_registered_) {
+    if (!is_file_mmap) {
       fs->DeleteFile(writer.file_name(), fopt.io_options, &dbg_ctx);
     }
     return err;
@@ -1983,7 +1968,6 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
                  is_file_mmap ? "seek" : "write", (t2 - t1) / 1e3,
                  (t3 - t2) / 1e3, (t4 - t3) / 1e3, (t5 - t4) / 1e3,
                  (t6 - t5) / 1e3, (t7 - t6) / 1e3, (t7 - t0) / 1e3);
-  has_converted_to_sst_ = true;
   TEST_SYNC_POINT("MemTableRep::ConvertToSST:After");
   return s;
 } catch (const std::exception& ex) {

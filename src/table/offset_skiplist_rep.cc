@@ -1656,11 +1656,9 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
                                  Logger* logger, uint32_t /*cf_id*/) final {
     auto cap = ChooseMemCap(mem_cap, mcfopt.write_buffer_size);
     auto convert = convert_to_sst;
-    if (memtable_file_path.empty() && convert == OSLConvertKind::kFileMmap) {
-      convert = OSLConvertKind::kDumpMem;
-    }
     auto uc = cmp.icomparator()->user_comparator();
     if (convert == OSLConvertKind::kFileMmap) {
+      ROCKSDB_VERIFY(!memtable_file_path.empty());
       const std::string path = chroot_dir + memtable_file_path;
       int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
       if (fd < 0) {

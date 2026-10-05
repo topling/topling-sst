@@ -119,6 +119,7 @@ struct OffsetSkipListMeta {
   int32_t k_max_height;
   int32_t k_branching;
   uint64_t num_user_keys;  // on-disk name; value is slow_exact_num_nodes()
+  SequenceNumber pubseq;  // 0 means kMaxSequenceNumber.
 };
 #pragma pack(pop)
 
@@ -442,6 +443,7 @@ class OffsetSkipListRep : public MemTableRep {
     m->k_max_height = sl_k_max_height();
     m->k_branching = sl_k_branching();
     m->num_user_keys = sl_slow_exact_num_nodes();
+    m->pubseq = max_visible_seq_ == kMaxSequenceNumber ? 0 : max_visible_seq_;
   }
 
   void FillTableProperties(TableProperties* p) const {
@@ -1914,9 +1916,6 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
       oss.pop_back();
     }
   }
-  if (max_visible_seq_ != kMaxSequenceNumber) {
-    builder.properties_.compression_options += ";VisFilter:1";
-  }
   Status s = builder.Finish();
   if (!s.ok()) {
     return fail_after_open(s);
@@ -2083,6 +2082,8 @@ class OffsetSkipListTableReader : public TopTableReaderBase {
     ROCKSDB_JSON_SET_PROP(djs, token_use_idle);
     ROCKSDB_JSON_SET_PROP(djs, enable_gc);
     ROCKSDB_JSON_SET_PROP(djs, lookahead);
+    djs["pubseq"] = memtab_->max_visible_seq_ == kMaxSequenceNumber
+        ? json("kMaxSequenceNumber") : json(memtab_->max_visible_seq_);
 
     OffsetSkipListMeta meta;
     memtab_->FillMeta(&meta);
@@ -2203,13 +2204,11 @@ OffsetSkipListTableReader::OffsetSkipListTableReader(
   memtab_->ref_to_wal_ = static_cast<OSLLogRefFormat>(sst_meta->log_ref);
   table_properties_->compression_name = "OffsetSkipList";
   std::string& compression_options = table_properties_->compression_options;
-  const fstring opts(compression_options);
-  for (size_t pos = 0; pos < opts.size();) {
-    if (opts.iter_field(pos, ';') == "VisFilter:1") {
-      memtab_->max_visible_seq_ = tro.largest_seqno;
-      break;
-    }
+  const auto pubseq = sst_meta->pubseq;
+  if (pubseq > kMaxSequenceNumber) {
+    throw Status::Corruption(file->file_name(), "bad OSL pubseq");
   }
+  memtab_->max_visible_seq_ = pubseq ? pubseq : kMaxSequenceNumber;
   if (Slice(compression_options).starts_with("LogRef:")) {
     memtab_->wals_ = new OffsetSkipListRep::LogFileLookup[OffsetSkipListRep::MAX_WALS]{};
     const char* item = strchr(compression_options.c_str(), ';');
@@ -2256,6 +2255,10 @@ OffsetSkipListTableReader::OffsetSkipListTableReader(
         break;
       }
     }
+  }
+  if (memtab_->max_visible_seq_ != kMaxSequenceNumber) {
+    compression_options += ";pubseq:";
+    compression_options += std::to_string(memtab_->max_visible_seq_);
   }
   memtab_->FillTableProperties(table_properties_.get());
   factory_ = f;

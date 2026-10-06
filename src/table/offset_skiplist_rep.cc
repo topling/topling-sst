@@ -2088,6 +2088,9 @@ class OffsetSkipListTableReader : public TopTableReaderBase {
   OffsetSkipListTableReader(RandomAccessFileReader*, Slice file_data,
                             const TableReaderOptions&,
                             const OffsetSkipListTableFactory*);
+  bool IsNumEntriesExact() const final {
+    return memtab_->max_visible_seq_ == kMaxSequenceNumber;
+  }
   InternalIterator* NewIterator(const ReadOptions&,
                                 const SliceTransform* /*prefix_extractor*/,
                                 Arena* arena, bool /*skip_filters*/,

@@ -19,7 +19,7 @@
 // enable_gc (default true): LazyFree + GC + TLS tokens. Get / Contains /
 // SST_Get pin a token while writable so COW LazyFree cannot revoke the
 // value array. After MarkReadOnly, GCAll has run — skip the token.
-// enable_gc=false: no LazyFree, no GC, no token; COW arrays stay until
+// enable_gc=false: no LazyFree, no GC pinning; COW arrays stay until
 // the memtable is destroyed. Pin via need_pin() (m_flag == kFlagGc);
 // do not encode that as Token* == nullptr.
 // EstimateCount only walks skiplist nodes (published nodes are never
@@ -71,6 +71,7 @@
 #include <rocksdb/memtablerep.h>
 #include <rocksdb/write_batch.h>
 #include <table/get_context.h>
+#include <table/memtable_rep_stats.h>
 #include <table/top_table_builder.h>
 #include <table/top_table_reader.h>
 #include <table/unique_id_impl.h>
@@ -128,11 +129,9 @@ struct OSLRepHeader {
   static constexpr uint32_t kMaxWals = 16;
   uint32_t log_ref;
   uint32_t num_wals;
-  struct WalSlot {
-    uint64_t fileno;
-    uint64_t cnt;
-    uint64_t bytes;
-  } wals[kMaxWals];
+  using WalSlot = MemTableRepStats::WalSlot;
+  WalSlot wals[kMaxWals];
+  uint32_t stats_head;
 };
 static_assert(sizeof(OSLRepHeader) <= sizeof(terark::OSL_MmapHeader::reserved));
 
@@ -392,6 +391,7 @@ class OffsetSkipListRep : public MemTableRep {
   OSLLogRefFormat ref_to_wal_ = OSLLogRefFormat::kNoLogRef;
   bool token_use_idle_ = true;
   size_t num_wals_ = 0;
+  uint64_t cached_wal_bytes_ = 0;
   LogFileLookup* wals_ = nullptr;
   const ReadonlyFileMmap* walmaps_[MAX_WALS] = {};
   std::mutex wal_mtx_;
@@ -468,11 +468,7 @@ class OffsetSkipListRep : public MemTableRep {
   }
 
   size_t ApproximateMemoryUsage() override {
-    size_t walsize = 0;
-    for (size_t i = 0; i < num_wals_; ++i) {
-      walsize += wals_[i].bytes;
-    }
-    return sl_mem_size() + walsize;
+    return sl_mem_size() + as_atomic(cached_wal_bytes_).load(std::memory_order_relaxed);
   }
 
   uint64_t ApproximateNumEntries(const Slice& start_ikey,
@@ -515,6 +511,7 @@ class OffsetSkipListRep : public MemTableRep {
     return ref_to_wal_ != OSLLogRefFormat::kNoLogRef;
   }
   Status ConvertToSST(FileMetaData*, const TableBuilderOptions&) final;
+  Status ConvertToSSTImpl(FileMetaData*, const TableBuilderOptions&);
 
 };
 
@@ -527,24 +524,42 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   OffsetSL skip_list_;
 
   struct Token : OffsetSL::Token {
-    struct CntBytes {
-      uint64_t cnt = 0;
-      uint64_t bytes = 0;
-    };
-    CntBytes wal_cnt_[MAX_WALS] = {};
+    MemTableRepStats* stats_ = nullptr;
+    uint64_t pending_cnt_ = 0;
+    uint64_t pending_bytes_ = 0;
+
+    Token(OffsetSkipListRepT* tab, typename OffsetSL::MemTls* tc) {
+      if (auto* hdr = tab->sl_mmap_header()) {
+        size_t pos = tab->skip_list_.tls_alloc(
+            sizeof(MemTableRepStats) + alignof(MemTableRepStats) - kAlign, tc);
+        TERARK_VERIFY_NE(pos, size_t(-1));
+        pos = terark::pow2_align_up(pos, alignof(MemTableRepStats));
+        TERARK_VERIFY_LE(pos / kAlign, UINT32_MAX);
+        stats_ = MemTableRepStats::Link(
+            tab->base(), uint32_t(pos / kAlign), RepHdr(hdr)->stats_head);
+      } else {
+        stats_ = new MemTableRepStats;
+      }
+    }
 
    protected:
     ~Token() override {
       auto* list = this->skiplist();
-      if (!list) {
-        return;
-      }
       auto* tab = reinterpret_cast<OffsetSkipListRepT*>(
           reinterpret_cast<char*>(list) -
           offsetof(OffsetSkipListRepT, skip_list_));
       tab->ApplyWalToken(this);
+      if (tab->m_convert_to_sst != ConvertKind::kFileMmap) {
+        delete stats_;
+      }
     }
   };
+
+  Token* GetToken(typename OffsetSL::MemTls* tc) const {
+    return tc->get_token([this, tc] {
+      return new Token(const_cast<OffsetSkipListRepT*>(this), tc);
+    });
+  }
 
   int CmpUkey(Slice a, Slice b) const { return SliceCmp{ucmp_}(a, b); }
 
@@ -560,7 +575,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     skip_list_.FinishHint(static_cast<typename OffsetSL::MemTls*>(hint));
     if (skip_list_.is_gc_enabled()) {
       auto* tls = static_cast<typename OffsetSL::MemTls*>(hint);
-      ParkToken(tls->template get_token<Token>());
+      ParkToken(GetToken(tls));
     }
   }
 
@@ -635,38 +650,40 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   }
 
   void ApplyWalToken(Token* tok) {
-    for (size_t i = 0; i < num_wals_; ++i) {
-      as_atomic(wals_[i].cnt)
-          .fetch_add(tok->wal_cnt_[i].cnt, std::memory_order_relaxed);
-      as_atomic(wals_[i].bytes)
-          .fetch_add(tok->wal_cnt_[i].bytes, std::memory_order_relaxed);
-      tok->wal_cnt_[i] = {};
-    }
+    as_atomic(cached_wal_bytes_).fetch_add(tok->pending_bytes_, std::memory_order_relaxed);
+    tok->pending_cnt_ = 0;
+    tok->pending_bytes_ = 0;
   }
   void FlushAllWalTls() final {
+    if (m_convert_to_sst != ConvertKind::kFileMmap) {
+      for (size_t i = 0; i < num_wals_; i++) {
+        wals_[i].cnt = 0;
+        wals_[i].bytes = 0;
+      }
+    }
     skip_list_.for_each_tls_token([this](typename OffsetSL::Token* t) {
       if (auto* w = dynamic_cast<Token*>(t)) {
         ApplyWalToken(w);
+        if (m_convert_to_sst != ConvertKind::kFileMmap) {
+          for (size_t i = 0; i < num_wals_; i++) {
+            wals_[i].cnt += w->stats_->wals[i].cnt;
+            wals_[i].bytes += w->stats_->wals[i].bytes;
+          }
+        }
       }
     });
   }
   template <class Entry>
   void AccountWal(Token* tok, size_t fidx, size_t valsize) {
-    if (tok == nullptr) {
-      as_atomic(wals_[fidx].cnt).fetch_add(1, std::memory_order_relaxed);
-      as_atomic(wals_[fidx].bytes).fetch_add(valsize, std::memory_order_relaxed);
-      return;
-    }
-    auto& x = tok->wal_cnt_[fidx];
+    auto& x = tok->stats_->wals[fidx];
     x.cnt++;
     x.bytes += valsize;
     constexpr size_t kWalTlsFlushBytes = 512 * 1024;
-    size_t approx = x.cnt * sizeof(Entry) + x.bytes;
+    tok->pending_cnt_++;
+    tok->pending_bytes_ += valsize;
+    size_t approx = tok->pending_cnt_ * sizeof(Entry) + tok->pending_bytes_;
     if (UNLIKELY(approx > kWalTlsFlushBytes)) {
-      as_atomic(wals_[fidx].cnt).fetch_add(x.cnt, std::memory_order_relaxed);
-      as_atomic(wals_[fidx].bytes)
-          .fetch_add(x.bytes, std::memory_order_relaxed);
-      x = {};
+      ApplyWalToken(tok);
     }
   }
 
@@ -832,7 +849,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       return true;
     }
     // Cold: full or out-of-order. GC only here, still holding the lock.
-    if (token) {
+    if (skip_list_.is_gc_enabled()) {
       skip_list_.GC(token);
     }
     const uint32_t want = num == old_cap ? old_cap * 2 : old_cap;
@@ -858,7 +875,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     const size_t old_pos = size_t(vec->pos) * kAlign;
     vec->pos = uint32_t(cow_pos / kAlign);
     as_atomic(vec->num).store(num + 1, std::memory_order_release);
-    if (token) {
+    if (skip_list_.is_gc_enabled()) {
       skip_list_.LazyFree(old_pos, sizeof(Entry) * old_cap, token);
     }
     return true;
@@ -876,23 +893,40 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
         slot = skip_list_.tls_get();
         tc = slot;
         if (gc) {
-          tok = tc->template get_token<Token>();
+          tok = GetToken(tc);
           tok->acquire(&skip_list_);
         }
       } else {
         tc = slot;
         tc->assert_current_thread();
         if (gc) {
-          tok = tc->template get_token<Token>();
+          tok = GetToken(tc);
         }
       }
     } else {
       tc = skip_list_.tls_get();
       if (gc) {
-        tok = tc->template get_token<Token>();
+        tok = GetToken(tc);
         tok->acquire(&skip_list_);
       }
     }
+    if (!tok && (m_convert_to_sst == ConvertKind::kFileMmap ||
+                 ref_to_wal_ != OSLLogRefFormat::kNoLogRef)) {
+      tok = GetToken(tc);
+    }
+    auto* stats = m_convert_to_sst == ConvertKind::kFileMmap ? tok->stats_ : nullptr;
+    auto account_stats = [&]() {
+      if (stats) {
+        size_t real_value_size = val.size();
+        if constexpr (!std::is_same_v<Entry, KeyValueToMemRef>) {
+          if (!val.empty()) {
+            real_value_size = reinterpret_cast<const KeyValuePassMemTable*>(
+                                  val.data())->value.size_;
+          }
+        }
+        stats->Add(tag, ukey.size(), real_value_size);
+      }
+    };
     const size_t val_leading = ValueLeadingSize<Entry>(val);
     const size_t key_bytes = KeyPayloadSize<Entry>(ukey);
     char* node = AllocNewNode<Entry>(ukey, tag, val, tok, tc, val_leading,
@@ -912,6 +946,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       }
     }
     if (LIKELY(exist == nullptr)) {
+      account_stats();
       if constexpr (!std::is_same_v<Entry, KeyValueToMemRef>) {
         AccountFirstInsert<Entry>(val, tok);
       }
@@ -928,6 +963,9 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       skip_list_.FreeUnusedKey(node, key_bytes, tc);
     }
     const bool dup_ok = InsertDup<Entry>(exist, tag, val, tok, tc, reuse_vpos);
+    if (dup_ok) {
+      account_stats();
+    }
     if (gc && hint == nullptr) {
       ParkToken(tok);
     }
@@ -973,7 +1011,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     const bool pin = skip_list_.need_pin();
     Token* tok = nullptr;
     if (pin) {
-      tok = skip_list_.template tls_token_nn<Token>();
+      tok = GetToken(skip_list_.tls_get());
       tok->acquire(const_cast<OffsetSL*>(&skip_list_));
     }
     const char* node = FindNode(ukey);
@@ -1011,7 +1049,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     const bool pin = skip_list_.need_pin();
     Token* tok = nullptr;
     if (pin) {
-      tok = skip_list_.template tls_token_nn<Token>();
+      tok = GetToken(skip_list_.tls_get());
       tok->acquire(&skip_list_);
     }
     const char* node = FindNode(k.user_key);
@@ -1070,7 +1108,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     const bool pin = skip_list_.need_pin();
     Token* tok = nullptr;
     if (pin) {
-      tok = skip_list_.template tls_token_nn<Token>();
+      tok = GetToken(skip_list_.tls_get());
       tok->acquire(const_cast<OffsetSL*>(&skip_list_));
     }
     const char* node = FindNode(pikey.user_key);
@@ -1774,9 +1812,25 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
     tab.ref_to_wal_ = static_cast<OSLLogRefFormat>(RepHdr(hdr)->log_ref);
     tab.BindFactoryTokenOpts();
     auto* rh = RepHdr(hdr);
+    if (rh->num_wals > MemTableRepStats::kMaxWals) {
+      return Status::Corruption(leftover_path,
+          string_appender<>() << "invalid MemTable WAL count: "
+                             << rh->num_wals);
+    }
+    auto* base = static_cast<uint8_t*>(p);
+    size_t remaining = used / sizeof(MemTableRepStats);
+    for (uint32_t head = rh->stats_head; head;) {
+      size_t pos = size_t(head) * 4;
+      if (pos % alignof(MemTableRepStats) || pos > used ||
+          used - pos < sizeof(MemTableRepStats) || remaining-- == 0) {
+        return Status::Corruption(leftover_path, "invalid MemTable statistics chain");
+      }
+      head = reinterpret_cast<const MemTableRepStats*>(base + pos)->next;
+    }
     tab.wals_ = rh->wals;
     tab.num_wals_ = as_atomic(rh->num_wals).load(std::memory_order_acquire);
-    Status s = tab.ConvertToSST(meta, tboptions);
+    MemTableRepStats::Recover(base, rh->stats_head, meta, tab.wals_, tab.num_wals_);
+    Status s = tab.ConvertToSSTImpl(meta, tboptions);
     TEST_SYNC_POINT_CALLBACK("CrashSafeRecover::ConvertToSST:InjectStatus", &s);
     TEST_SYNC_POINT("CrashSafeRecover::AfterConvertBeforeAddFile");
     return s;
@@ -1792,8 +1846,15 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
   return recover(FallbackUserKeySliceCmp{uc});
 }
 
-Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
-                                       const TableBuilderOptions& tbo) try {
+Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta, const TableBuilderOptions& tbo) {
+  if (m_convert_to_sst == ConvertKind::kFileMmap) {
+    auto* rh = RepHdr(sl_mmap_header());
+    MemTableRepStats::Recover(base(), rh->stats_head, nullptr, wals_, num_wals_);
+  }
+  return ConvertToSSTImpl(meta, tbo);
+}
+
+Status OffsetSkipListRep::ConvertToSSTImpl(FileMetaData* meta, const TableBuilderOptions& tbo) try {
   TEST_SYNC_POINT("MemTableRep::ConvertToSST:Before");
   FlushAllWalTls();
   MemGC();
@@ -1874,6 +1935,14 @@ Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta,
     }
   }
   double t2 = clock->NowMicros();
+  if (!is_file_mmap) {
+    FlushAllWalTls();
+  }
+  uint64_t total = 0;
+  for (size_t i = 0; i < num_wals_; i++) {
+    total += wals_[i].bytes;
+  }
+  as_atomic(cached_wal_bytes_).store(total, std::memory_order_relaxed);
   builder.properties_.num_data_blocks = 1;
   builder.properties_.num_entries = meta->num_entries;
   builder.properties_.num_deletions = meta->num_deletions;
@@ -2244,6 +2313,7 @@ OffsetSkipListTableReader::OffsetSkipListTableReader(
       memtab_->wals_[i].cnt = cnt;
       memtab_->walmaps_[i] = fmap.get();
       memtab_->wals_[i].bytes = bytes;
+      memtab_->cached_wal_bytes_ += bytes;
       memtab_->num_wals_++;
       TERARK_VERIFY_LE(memtab_->num_wals_, OffsetSkipListRep::MAX_WALS);
       intrusive_ptr_add_ref(fmap.get());

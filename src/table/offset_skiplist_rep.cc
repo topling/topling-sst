@@ -422,6 +422,7 @@ class OffsetSkipListRep : public MemTableRep {
     as_atomic(num_wals_).fetch_add(1);
     intrusive_ptr_add_ref(const_cast<ReadonlyFileMmap*>(wal));
     if (auto* h = sl_mmap_header()) {
+      TERARK_VERIFY_EQ(m_convert_to_sst, ConvertKind::kFileMmap);
       auto* rh = RepHdr(h);
       // A process can crash inside the critical section, before mutex unlock.
       // Only compiler reordering needs to be prevented here, but there is no
@@ -530,6 +531,8 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
 
     Token(OffsetSkipListRepT* tab, typename OffsetSL::MemTls* tc) {
       if (auto* hdr = tab->sl_mmap_header()) {
+        // ~Token uses this same fact to decide whether stats_ is arena-owned.
+        TERARK_VERIFY_EQ(tab->m_convert_to_sst, ConvertKind::kFileMmap);
         size_t pos = tab->skip_list_.tls_alloc(
             sizeof(MemTableRepStats) + alignof(MemTableRepStats) - kAlign, tc);
         TERARK_VERIFY_NE(pos, size_t(-1));
@@ -538,6 +541,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
         stats_ = MemTableRepStats::Link(
             tab->base(), uint32_t(pos / kAlign), RepHdr(hdr)->stats_head);
       } else {
+        TERARK_VERIFY_NE(tab->m_convert_to_sst, ConvertKind::kFileMmap);
         stats_ = new MemTableRepStats;
       }
     }
@@ -675,6 +679,8 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   }
   template <class Entry>
   void AccountWal(Token* tok, size_t fidx, size_t valsize) {
+    // Only WAL-ref values are accounted: InsertKVTpl has made a token.
+    TERARK_ASSERT_NE(tok, nullptr);
     auto& x = tok->stats_->wals[fidx];
     x.cnt++;
     x.bytes += valsize;
@@ -1755,6 +1761,7 @@ void OffsetSkipListRep::BindFactoryTokenOpts() {
 void OffsetSkipListRep::InitSetMemTableAsLogIndex(bool b) {
   ref_to_wal_ = b ? fac_->log_ref_format : OSLLogRefFormat::kNoLogRef;
   if (auto* h = sl_mmap_header()) {
+    TERARK_VERIFY_EQ(m_convert_to_sst, ConvertKind::kFileMmap);
     memset(h, 0, sizeof(*h));
     terark::InitOSLMmapHeaderIdentity(h, sl_class_name());
     h->mem_used = sl_mem_size();
@@ -1820,7 +1827,7 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
     auto* base = static_cast<uint8_t*>(p);
     size_t remaining = used / sizeof(MemTableRepStats);
     for (uint32_t head = rh->stats_head; head;) {
-      size_t pos = size_t(head) * 4;
+      size_t pos = size_t(head) * kAlign;
       if (pos % alignof(MemTableRepStats) || pos > used ||
           used - pos < sizeof(MemTableRepStats) || remaining-- == 0) {
         return Status::Corruption(leftover_path, "invalid MemTable statistics chain");
@@ -1848,6 +1855,7 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
 
 Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta, const TableBuilderOptions& tbo) {
   if (m_convert_to_sst == ConvertKind::kFileMmap) {
+    TERARK_VERIFY_NE(sl_mmap_header(), nullptr);
     auto* rh = RepHdr(sl_mmap_header());
     MemTableRepStats::Recover(base(), rh->stats_head, nullptr, wals_, num_wals_);
   }

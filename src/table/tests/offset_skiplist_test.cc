@@ -575,7 +575,7 @@ TEST_F(OffsetSkipTest, InsertWithHint_MultipleHints) {
   const int N = 250;
   const int S = 12;
   TestComparator cmp;
-  TestOffsetSkipList list(cmp, kTestMemCap);
+  TestOffsetSkipList list(cmp, size_t(32) << 20);  // Each TLS reserves 2 MiB.
   std::vector<std::thread> threads;
   threads.reserve(S);
   for (int s = 0; s < S; ++s) {

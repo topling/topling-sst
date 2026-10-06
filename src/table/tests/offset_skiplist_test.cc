@@ -2264,8 +2264,9 @@ TEST(OffsetSkipRepTest, ConvertToSST_FileMmap) {
   it->~InternalIterator();
 }
 
-TEST(OffsetSkipRepTest, LogRef_ConvertToSST_Reopen) {
-  std::string dir = test::PerThreadDBPath("offset_skiplist_logref");
+static void LogRefConvertToSSTReopen(bool enable_gc) {
+  std::string dir = test::PerThreadDBPath(
+      enable_gc ? "offset_skiplist_logref" : "offset_skiplist_logref_no_gc");
   ASSERT_OK(Env::Default()->CreateDirIfMissing(dir));
   Options options;
   options.cf_paths = {{dir, 0}};
@@ -2298,7 +2299,9 @@ TEST(OffsetSkipRepTest, LogRef_ConvertToSST_Reopen) {
   wal->tail_pos = std::make_shared<uint64_t>(payload.size());
 
   std::unique_ptr<MemTable> mem(NewOffsetMemTable(
-      &options, &wb, R"({"mem_cap":16777216,"convert_to_sst":"kDumpMem"})"));
+      &options, &wb, enable_gc ?
+      R"({"mem_cap":16777216,"convert_to_sst":"kDumpMem"})" :
+      R"({"mem_cap":16777216,"convert_to_sst":"kDumpMem","enable_gc":false})"));
   ASSERT_TRUE(mem->SupportConvertToSST());
 
   auto add_logref = [&](SequenceNumber seq, const Slice& ukey, size_t val_pos,
@@ -2313,8 +2316,16 @@ TEST(OffsetSkipRepTest, LogRef_ConvertToSST_Reopen) {
                        Slice(reinterpret_cast<const char*>(&kv), sizeof(kv)),
                        nullptr));
   };
-  add_logref(1, "key1", pos1, Slice(wal->data() + pos1, v1.size()));
-  add_logref(2, "key2", pos2, Slice(wal->data() + pos2, v2.size()));
+  auto add_values = [&] {
+    add_logref(1, "key1", pos1, Slice(wal->data() + pos1, v1.size()));
+    add_logref(2, "key2", pos2, Slice(wal->data() + pos2, v2.size()));
+  };
+  if (enable_gc) {
+    add_values();
+  } else {
+    std::thread writer(add_values);
+    writer.join();  // Runtime TLS cumulative counts must outlive this writer.
+  }
 
   MergeContext merge_context;
   SequenceNumber max_covering_tombstone_seq = 0;
@@ -2355,7 +2366,16 @@ TEST(OffsetSkipRepTest, LogRef_ConvertToSST_Reopen) {
   ASSERT_EQ(blobs.size(), 1U);
   ASSERT_EQ(blobs[0].GetBlobFileNumber(), 7U);
   ASSERT_EQ(blobs[0].GetTotalBlobCount(), 2U);
+  ASSERT_EQ(blobs[0].GetTotalBlobBytes(), v1.size() + v2.size());
   ASSERT_OK(Env::Default()->FileExists(BlobFileName(dir, 7)));
+  if (!enable_gc) {
+    blobs.clear();
+    ASSERT_OK(mem->ConvertToSST(&meta, tbo));
+    ASSERT_EQ(blobs.size(), 1U);
+    ASSERT_EQ(blobs[0].GetBlobFileNumber(), 8U);
+    ASSERT_EQ(blobs[0].GetTotalBlobCount(), 2U);
+    ASSERT_EQ(blobs[0].GetTotalBlobBytes(), v1.size() + v2.size());
+  }
 
   mem.reset();
   wal.reset();
@@ -2401,6 +2421,14 @@ TEST(OffsetSkipRepTest, LogRef_ConvertToSST_Reopen) {
   it->Next();
   ASSERT_FALSE(it->Valid());
   it->~InternalIterator();
+}
+
+TEST(OffsetSkipRepTest, LogRef_ConvertToSST_Reopen) {
+  LogRefConvertToSSTReopen(true);
+}
+
+TEST(OffsetSkipRepTest, LogRef_NoGc_ConvertToSST_Reopen) {
+  LogRefConvertToSSTReopen(false);
 }
 
 // Worker writes memtable A, A is destroyed, same worker writes B.

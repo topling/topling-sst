@@ -341,6 +341,9 @@ void SimpleTopTableBuilder::Add(const Slice& key, const Slice& value) try {
     }
   } else if (vt == kTypeRangeDeletion) {
     range_del_block_.Add(key, value);
+    properties_.raw_key_size += key.size();
+    properties_.raw_value_size += value.size();
+    properties_.num_deletions++;
     properties_.num_range_deletions++;
   } else {
     const char* ename = enum_name(vt).data();
@@ -374,6 +377,7 @@ bool SimpleTopTableBuilder::NeedCompact() const {
 
 Status SimpleTopTableBuilder::Finish() try {
   if (0 == properties_.num_entries) {
+    properties_.num_entries += properties_.num_range_deletions;
     TERARK_VERIFY_EQ(offset_, 0);
     ToplingFlushBuffer();
     FinishAsEmptyTable();
@@ -385,6 +389,7 @@ Status SimpleTopTableBuilder::Finish() try {
 
   const size_t n = size_t(properties_.num_entries);
   const size_t pool_size = size_t(offset_); // record pool already written in Add
+  properties_.num_entries += properties_.num_range_deletions;
 
   properties_.tag_size = 8 * n;
   properties_.num_data_blocks = 1;
@@ -465,11 +470,12 @@ Status SimpleTopTableBuilder::Finish() try {
   WriteMeta(kSimpleTopTableMagic, {{kMetaName, WriteBlock(meta.Memory(), file_, &offset_)}});
 
   auto fac = table_factory_;
-  auto ukey_len = properties_.raw_key_size - 8 * n;
+  auto ukey_len = properties_.raw_key_size - 8 * properties_.num_entries;
   long long t1 = g_pf.now();
   auto td = g_pf.us(t1 - t0);
-  // entry count (not unique ukey); SimpleTop does not collapse versions at build
-  as_atomic(fac->sum_user_key_cnt).fetch_add(n, std::memory_order_relaxed);
+  // entry count (not unique ukey); SimpleTop does not collapse versions at
+  // build. Range deletions count as entries, as they do in raw sizes above.
+  as_atomic(fac->sum_user_key_cnt).fetch_add(properties_.num_entries, std::memory_order_relaxed);
   as_atomic(fac->sum_user_key_len).fetch_add(ukey_len, std::memory_order_relaxed);
   as_atomic(fac->sum_value_len).fetch_add(properties_.raw_value_size, std::memory_order_relaxed);
   as_atomic(fac->sum_index_len).fetch_add(properties_.index_size, std::memory_order_relaxed);

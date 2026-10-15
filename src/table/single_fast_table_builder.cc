@@ -189,6 +189,7 @@ void SingleFastTableBuilder::Add(const Slice& key, const Slice& value) try {
       is_all_seqno_zero_ = false;
     }
     range_del_block_.Add(key, value);
+    properties_.num_deletions++;
     properties_.num_range_deletions++;
   }
   else {

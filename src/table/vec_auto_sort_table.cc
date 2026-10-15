@@ -313,6 +313,7 @@ void VecAutoSortTableBuilder::Add(const Slice& key, const Slice& value) {
   }
   else if (vt == kTypeRangeDeletion) {
     range_del_block_.Add(key, value);
+    properties_.num_deletions++;
     properties_.num_range_deletions++;
   }
   else {

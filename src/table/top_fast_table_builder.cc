@@ -215,6 +215,7 @@ void TopFastTableBuilder::Add(const Slice& key, const Slice& value) try {
   }
   else if (vt == kTypeRangeDeletion) {
     range_del_block_.Add(key, value);
+    properties_.num_deletions++;
     properties_.num_range_deletions++;
   }
   else {

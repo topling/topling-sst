@@ -395,6 +395,11 @@ class OffsetSkipListRep : public MemTableRep {
   LogFileLookup* wals_ = nullptr;
   const ReadonlyFileMmap* walmaps_[MAX_WALS] = {};
   std::mutex wal_mtx_;
+  // MarkReadOnly() may shrink the mempool (set_readonly() unmaps its free
+  // tail), but Token::Token() allocates the per thread stats from it, so the
+  // two must be serialized, see MarkReadOnly() and Token::Token().
+  mutable std::mutex m_mtx_mark_readonly;
+  bool m_has_marked_readonly = false;
 
   size_t add_wal(size_t fileno, const ReadonlyFileMmap* wal) {
     TERARK_ASSERT_NE(fileno, 0);
@@ -504,7 +509,16 @@ class OffsetSkipListRep : public MemTableRep {
   void MarkReadOnly() override {
     FlushAllWalTls();
     MemGC();
-    sl_set_readonly();
+    {
+      // Serialize with Token::Token(), which allocates the per thread stats
+      // from the mempool: once the flag below is visible, no Token allocates
+      // from the mempool any more, so sl_set_readonly() may shrink it safely.
+      // Holding the lock here also means a concurrent Token::Token() either
+      // finishes its allocation before this shrink, or sees the flag.
+      std::lock_guard<std::mutex> lk(m_mtx_mark_readonly);
+      sl_set_readonly();
+      m_has_marked_readonly = true;
+    }
   }
 
   void InitSetMemTableAsLogIndex(bool b) final;
@@ -528,10 +542,15 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     MemTableRepStats* stats_ = nullptr;
     uint64_t pending_cnt_ = 0;
     uint64_t pending_bytes_ = 0;
+    bool stats_on_heap_ = false;  // see ~Token
 
     Token(OffsetSkipListRepT* tab, typename OffsetSL::MemTls* tc) {
-      if (auto* hdr = tab->sl_mmap_header()) {
-        // ~Token uses this same fact to decide whether stats_ is arena-owned.
+      // MarkReadOnly() shrinks the mempool (set_readonly() unmaps its free
+      // tail), and must not run concurrently with the stats allocation below,
+      // otherwise the allocated block may lie in the just unmapped tail.
+      std::lock_guard<std::mutex> lk(tab->m_mtx_mark_readonly);
+      if (auto* hdr = tab->sl_mmap_header();
+          hdr != nullptr && !tab->m_has_marked_readonly) {
         TERARK_VERIFY_EQ(tab->m_convert_to_sst, ConvertKind::kFileMmap);
         size_t pos = tab->skip_list_.tls_alloc(
             sizeof(MemTableRepStats) + alignof(MemTableRepStats) - kAlign, tc);
@@ -541,8 +560,11 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
         stats_ = MemTableRepStats::Link(
             tab->base(), uint32_t(pos / kAlign), RepHdr(hdr)->stats_head);
       } else {
-        TERARK_VERIFY_NE(tab->m_convert_to_sst, ConvertKind::kFileMmap);
+        // not file mmap, or the memtable has been marked readonly, in both
+        // cases the mempool must not be used (after MarkReadOnly() no more
+        // calls to Allocate() are allowed by the MemTableRep contract)
         stats_ = new MemTableRepStats;
+        stats_on_heap_ = true;
       }
     }
 
@@ -553,7 +575,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
           reinterpret_cast<char*>(list) -
           offsetof(OffsetSkipListRepT, skip_list_));
       tab->ApplyWalToken(this);
-      if (tab->m_convert_to_sst != ConvertKind::kFileMmap) {
+      if (stats_on_heap_) {  // otherwise stats_ is owned by the arena/mmap
         delete stats_;
       }
     }

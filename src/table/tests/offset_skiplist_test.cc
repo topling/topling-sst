@@ -1354,6 +1354,56 @@ TEST(OffsetSkipRepTest, FinishHintParksWriterToken) {
   ASSERT_EQ(value, "v3");
 }
 
+TEST(OffsetSkipRepTest, RangeDeletionBorrowsHintTokenOnDuplicate) {
+  for (bool idle : {false, true}) {
+    for (bool concurrent : {false, true}) {
+      SCOPED_TRACE(idle);
+      SCOPED_TRACE(concurrent);
+      Options options;
+      options.allow_concurrent_memtable_write = concurrent;
+      WriteBufferManager wb(options.db_write_buffer_size);
+      const std::string js =
+          std::string(R"({"mem_cap":16777216,"token_use_idle":)") +
+          (idle ? "true}" : "false}");
+      std::unique_ptr<MemTable> mem(NewOffsetMemTable(&options, &wb, js));
+      MemTablePostProcessInfo post;
+      auto add = [&](SequenceNumber seq, ValueType type, const Slice& key,
+                     const Slice& value, void** hint) {
+        return mem->Add(seq, type, key, value, nullptr, concurrent,
+                        concurrent ? &post : nullptr, hint);
+      };
+      // A standalone range deletion owns and parks its pin.
+      ASSERT_OK(add(1, kTypeRangeDeletion, "a", "c", nullptr));
+      void* hint = nullptr;
+      ASSERT_OK(add(2, kTypeValue, "z", "v1", &hint));
+      ASSERT_NE(hint, nullptr);
+      // Both successful and duplicate range inserts must leave the borrowed
+      // token acquired for the following hinted insert and FinishHint().
+      ASSERT_OK(add(3, kTypeRangeDeletion, "a", "d", &hint));
+      ASSERT_TRUE(add(3, kTypeRangeDeletion, "a", "d", &hint).IsTryAgain());
+      ASSERT_OK(add(4, kTypeValue, "zz", "v2", &hint));
+      ASSERT_OK(add(5, kTypeRangeDeletion, "a", "e", &hint));
+      ASSERT_OK(add(6, kTypeValue, "z", "v3", &hint));
+      mem->FinishHint(hint);
+      hint = nullptr;
+      // The token can be acquired again after the hint releases it.
+      ASSERT_OK(add(7, kTypeRangeDeletion, "f", "h", nullptr));
+      std::string value;
+      ASSERT_TRUE(MemGet(mem.get(), "z", 100, &value));
+      ASSERT_EQ(value, "v3");
+      ASSERT_TRUE(MemGet(mem.get(), "zz", 100, &value));
+      ASSERT_EQ(value, "v2");
+      std::unique_ptr<FragmentedRangeTombstoneIterator> rd(
+          mem->NewRangeTombstoneIterator(ReadOptions(), 100, false));
+      ASSERT_NE(rd, nullptr);
+      rd->Seek("f");
+      ASSERT_TRUE(rd->Valid());
+      ASSERT_EQ(rd->end_key().ToString(), "h");
+      ASSERT_EQ(rd->seq(), 7U);
+    }
+  }
+}
+
 TEST(OffsetSkipRepTest, MixConcurrentAndNonConcurrentInsert) {
   Options options;
   options.allow_concurrent_memtable_write = true;
@@ -2006,7 +2056,7 @@ TEST(OffsetSkipRepTest, SupportFlags) {
   {
     std::unique_ptr<TableFactory> tf(
         EasyNewTableFactory("OffsetSkipListTable", "{}"));
-    ASSERT_FALSE(tf->IsDeleteRangeSupported());
+    ASSERT_TRUE(tf->IsDeleteRangeSupported());
   }
 }
 

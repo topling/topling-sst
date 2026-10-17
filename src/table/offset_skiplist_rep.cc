@@ -85,6 +85,7 @@
 #include <terark/offset_skiplist.hpp>
 #include <terark/sso.hpp>
 #include <terark/util/atomic.hpp>
+#include <terark/util/function.hpp>
 #include <terark/valvec.hpp>
 
 namespace rocksdb {
@@ -110,6 +111,12 @@ constexpr uint32_t kLockFlag = uint32_t(1) << 31;
 constexpr uint32_t kMetaVersion = 1;
 const std::string kMetaName = "OffsetSkipList";
 
+// A converted file always starts with the header of the mempool it holds:
+// kFileMmap's file is the memtable's own pool, whose header is the pool's first
+// bytes, and kDumpMem writes the pool with the header it carries. That header
+// is where the range deletion head is persisted, which is why the meta block
+// has no field for it.
+
 #pragma pack(push, 4)
 struct OffsetSkipListMeta {
   uint32_t version;
@@ -132,6 +139,12 @@ struct OSLRepHeader {
   using WalSlot = MemTableRepStats::WalSlot;
   WalSlot wals[kMaxWals];
   uint32_t stats_head;
+  // The head of the range deletion list, 0 when there is none. It lives in the
+  // header, not in the meta block, because that is the one thing a converted
+  // file always starts with: the crash safe recovery reads a memtable file that
+  // has no meta block yet, and the reader of a converted file takes it from the
+  // same place for both convert kinds.
+  uint32_t range_del_head;
 };
 static_assert(sizeof(OSLRepHeader) <= sizeof(terark::OSL_MmapHeader::reserved));
 
@@ -290,6 +303,19 @@ class OffsetSkipListRep : public MemTableRep {
   virtual void FlushAllWalTls() = 0;
   void BindFactoryTokenOpts();
   virtual void ApplyFactoryGc(bool v) = 0;
+  // Range deletions live in a second list of the same skip list, in the same
+  // mempool: this base class owns that list's head and count, the SliceCmp
+  // derived class owns the four operations below, which need the Entry layout.
+  virtual uint32_t sl_new_head() = 0;
+  virtual bool InsertRangeDel(uint64_t tag, const Slice& ukey, const Slice& val) = 0;
+  virtual bool ContainsAtHead(const Slice& ikey, uint32_t head) const = 0;
+  virtual MemTableRep::Iterator* GetIteratorAt(Arena*, uint32_t head) = 0;
+  MemTableRep* CreateRangeDelMemTableRep() final;
+  MemTableRep::Iterator* GetRangeDelIterator(Arena* a) {
+    auto head = as_atomic(m_range_del_head_).load(std::memory_order_relaxed);
+    return GetIteratorAt(a, head);
+  }
+  uint32_t CountHead(uint32_t head);
 
  protected:
   OffsetSkipListRep(Allocator* allocator, const Comparator* ucmp,
@@ -402,6 +428,8 @@ class OffsetSkipListRep : public MemTableRep {
   // for a rep that wraps bytes it does not own, a table reader or a crash safe
   // recovery: that header belongs to whoever wrote the bytes.
   terark::OSL_MmapHeader* m_pool_header = nullptr;
+  uint32_t m_range_del_head_ = 0;  // atomic, allocated lazily, rd is rare
+  uint32_t m_range_del_cnt_ = 0;   // atomic, rd is rare
 
   size_t add_wal(size_t fileno, const ReadonlyFileMmap* wal) {
     TERARK_ASSERT_NE(fileno, 0);
@@ -449,6 +477,25 @@ class OffsetSkipListRep : public MemTableRep {
     m->k_branching = sl_k_branching();
     m->num_user_keys = sl_slow_exact_num_nodes();
     m->pubseq = max_visible_seq_ == kMaxSequenceNumber ? 0 : max_visible_seq_;
+  }
+
+  uint32_t RangeDelHeadMayAlloc() {
+    auto head = as_atomic(m_range_del_head_).load(std::memory_order_relaxed);
+    return LIKELY(head) ? head : RangeDelHeadDoAlloc();
+  }
+  uint32_t RangeDelHeadDoAlloc() {
+    // Same lock as MarkReadOnly(): the head is allocated from the mempool,
+    // which MarkReadOnly() may shrink.
+    std::lock_guard<std::mutex> lk(m_mtx_mark_readonly);
+    uint32_t head = m_range_del_head_;
+    if (LIKELY(head)) {  // allocated by another inserter while this one waited
+      return head;
+    }
+    head = sl_new_head();
+    as_atomic(m_range_del_head_).store(head, std::memory_order_release);
+    TERARK_VERIFY_NE(m_pool_header, nullptr);
+    RepHdr(m_pool_header)->range_del_head = head;
+    return head;
   }
 
   void FillTableProperties(TableProperties* p) const {
@@ -528,6 +575,62 @@ class OffsetSkipListRep : public MemTableRep {
   Status ConvertToSSTImpl(FileMetaData*, const TableBuilderOptions&);
 
 };
+
+// The memtable hands this to MemTable as its range deletion table: the range
+// deletions of a memtable are ordinary contents of the main rep, inserted into
+// a second list of the same mempool, so they are flushed into the memtable's
+// own file and read back from it.
+class OSLRangeDelMemTab final : public MemTableRep {
+  OffsetSkipListRep* const m_main;
+
+ public:
+  explicit OSLRangeDelMemTab(OffsetSkipListRep* main)
+      : MemTableRep(nullptr), m_main(main) {}
+  bool SupportMemTableAsLogIndex() const final {
+    return m_main->SupportMemTableAsLogIndex();
+  }
+  bool InsertKeyValue(uint64_t tag, const Slice& ukey, const Slice& val) final {
+    return m_main->InsertRangeDel(tag, ukey, val);
+  }
+  bool InsertKeyValueConcurrently(uint64_t tag, const Slice& ukey,
+                                  const Slice& val) final {
+    return m_main->InsertRangeDel(tag, ukey, val);
+  }
+  bool Contains(const Slice& ikey) const final {
+    auto head = as_atomic(m_main->m_range_del_head_).load(std::memory_order_relaxed);
+    return head && m_main->ContainsAtHead(ikey, head);
+  }
+  MemTableRep::Iterator* GetIterator(Arena* arena) final {
+    return m_main->GetRangeDelIterator(arena);
+  }
+  size_t ApproximateMemoryUsage() final {
+    return 0;  // all in the main rep's mempool, m_main accounts for it
+  }
+  uint64_t ApproximateNumEntries(const Slice&, const Slice&) final {
+    return as_atomic(m_main->m_range_del_cnt_).load(std::memory_order_relaxed);
+  }
+  KeyHandle Allocate(const size_t, char**) final { TERARK_DIE("Bad call"); }
+  void Insert(KeyHandle) final { TERARK_DIE("Bad call"); }
+  void Get(const ReadOptions&, const LookupKey&, void*,
+           bool (*)(void*, const KeyValuePair&)) final {
+    TERARK_DIE("Bad call");
+  }
+};
+
+MemTableRep* OffsetSkipListRep::CreateRangeDelMemTableRep() {
+  return new OSLRangeDelMemTab(this);
+}
+
+uint32_t OffsetSkipListRep::CountHead(uint32_t head) {
+  uint32_t cnt = 0;
+  if (head) {
+    std::unique_ptr<MemTableRep::Iterator> iter(GetIteratorAt(nullptr, head));
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      cnt++;
+    }
+  }
+  return cnt;
+}
 
 template <class SliceCmp>
 class OffsetSkipListRepT final : public OffsetSkipListRep {
@@ -672,6 +775,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     return skip_list_.mempool().frag_size();
   }
   uint32_t sl_head_loc() const final { return skip_list_.head_loc(); }
+  uint32_t sl_new_head() final { return skip_list_.NewHead(); }
   int sl_max_height() const final { return skip_list_.max_height(); }
   int sl_k_max_height() const final { return skip_list_.k_max_height(); }
   int sl_k_branching() const final { return skip_list_.k_branching(); }
@@ -782,8 +886,8 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
 
   // Search itself does not take a Token (the old Token* overload only
   // forwarded). Callers that then read a value array pin when writable.
-  const char* FindNode(Slice ukey) const {
-    auto found = skip_list_.FindGreaterOrEqual(ukey);
+  const char* FindNode(Slice ukey, uint32_t head = OffsetSL::nil) const {
+    auto found = skip_list_.FindGreaterOrEqual(ukey, head);
     if (found.first != OffsetSL::nil && found.second == 0) {
       return skip_list_.KeyOf(found.first);
     }
@@ -923,9 +1027,13 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   }
 
   template <class Entry, bool Concurrent>
-  bool InsertKVTpl(uint64_t tag, const Slice& ukey, const Slice& val,
-                   void** hint) {
+  bool InsertKVTpl(uint64_t tag, const Slice& ukey, const Slice& val, void** hint,
+                   uint32_t head = OffsetSL::nil) {
     Token* tok = nullptr;
+    bool park_token = false;
+    TERARK_SCOPE_EXIT(if (park_token) {
+                        ParkToken(tok);
+                      });
     typename OffsetSL::MemTls* tc;
     const bool gc = skip_list_.is_gc_enabled();
     if (hint != nullptr) {
@@ -948,7 +1056,12 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       tc = skip_list_.tls_get();
       if (gc) {
         tok = GetToken(tc);
-        tok->acquire(&skip_list_);
+        // A batch hint can already hold this TLS token for the main list.
+        // Range deletions share it, so borrow the pin until FinishHint().
+        if (tok->state() != OffsetSL::AcquireDone) {
+          tok->acquire(&skip_list_);
+          park_token = true;
+        }
       }
     }
     if (!tok && (m_convert_to_sst == ConvertKind::kFileMmap ||
@@ -973,7 +1086,10 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     char* node = AllocNewNode<Entry>(ukey, tag, val, tok, tc, val_leading,
                                      key_bytes);
     char* exist;
-    if (hint != nullptr) {
+    if (head != OffsetSL::nil) {  // a range-del head from NewHead()
+      TERARK_ASSERT_EQ(hint, nullptr);
+      exist = skip_list_.InsertAt(head, node, tc);
+    } else if (hint != nullptr) {
       if constexpr (Concurrent) {
         exist = skip_list_.InsertWithHintConcurrently(node, tc);
       } else {
@@ -991,9 +1107,6 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       if constexpr (!std::is_same_v<Entry, KeyValueToMemRef>) {
         AccountFirstInsert<Entry>(val, tok);
       }
-      if (gc && hint == nullptr) {
-        ParkToken(tok);
-      }
       return true;
     }
     size_t reuse_vpos = size_t(-1);
@@ -1007,22 +1120,28 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     if (dup_ok) {
       account_stats();
     }
-    if (gc && hint == nullptr) {
-      ParkToken(tok);
-    }
     return dup_ok;
   }
 
   template <bool Concurrent>
-  bool InsertKV(uint64_t tag, const Slice& ukey, const Slice& val,
-                void** hint) {
+  bool InsertKV(uint64_t tag, const Slice& ukey, const Slice& val, void** hint,
+                uint32_t head = OffsetSL::nil) {
     if (ref_to_wal_ == OSLLogRefFormat::kPlainLogRef) {
-      return InsertKVTpl<KeyValueToLogRef, Concurrent>(tag, ukey, val, hint);
+      return InsertKVTpl<KeyValueToLogRef, Concurrent>(tag, ukey, val, hint, head);
     }
     if (ref_to_wal_ == OSLLogRefFormat::kShortLogRef) {
-      return InsertKVTpl<KV_ToShortLogRef, Concurrent>(tag, ukey, val, hint);
+      return InsertKVTpl<KV_ToShortLogRef, Concurrent>(tag, ukey, val, hint, head);
     }
-    return InsertKVTpl<KeyValueToMemRef, Concurrent>(tag, ukey, val, hint);
+    return InsertKVTpl<KeyValueToMemRef, Concurrent>(tag, ukey, val, hint, head);
+  }
+
+  bool InsertRangeDel(uint64_t tag, const Slice& ukey, const Slice& val) final {
+    const uint32_t head = RangeDelHeadMayAlloc();
+    const bool ret = InsertKV<false>(tag, ukey, val, nullptr, head);
+    if (ret) {
+      as_atomic(m_range_del_cnt_).fetch_add(1, std::memory_order_relaxed);
+    }
+    return ret;
   }
 
   bool InsertKeyValue(uint64_t tag, const Slice& ukey,
@@ -1044,6 +1163,10 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   }
 
   bool Contains(const Slice& internal_key) const override {
+    return ContainsAtHead(internal_key, sl_head_loc());
+  }
+
+  bool ContainsAtHead(const Slice& internal_key, uint32_t head) const final {
     Slice ukey = ExtractUserKey(internal_key);
     uint64_t find_tag = DecodeFixed64(ukey.end());
     if (!VisibleTag(find_tag, find_tag >> 8, max_visible_seq_)) {
@@ -1055,7 +1178,7 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       tok = GetToken(skip_list_.tls_get());
       tok->acquire(const_cast<OffsetSL*>(&skip_list_));
     }
-    const char* node = FindNode(ukey);
+    const char* node = FindNode(ukey, head);
     if (!node) {
       if (pin) {
         ParkToken(tok);
@@ -1260,9 +1383,10 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   template <class Entry, bool NoPin>
   class Iter : public MemTableRep::Iterator {
    public:
-    explicit Iter(const OffsetSkipListRepT& rep)
+    explicit Iter(const OffsetSkipListRepT& rep,
+                  uint32_t head = OffsetSL::nil)
         : rep_(rep),
-          iter_(&rep.skip_list_),
+          iter_(&rep.skip_list_, head),
           lookahead_(rep.lookahead_) {}
     ~Iter() override = default;
 
@@ -1524,8 +1648,9 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     }
 
    public:
-    explicit VisibleIter(const OffsetSkipListRepT& rep)
-        : Base(rep), max_visible_seq_(rep.max_visible_seq_) {}
+    explicit VisibleIter(const OffsetSkipListRepT& rep,
+                         uint32_t head = OffsetSL::nil)
+        : Base(rep, head), max_visible_seq_(rep.max_visible_seq_) {}
 
     using Base::Seek;
     using Base::SeekForPrev;
@@ -1559,33 +1684,39 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   };
 
   template <class Entry, bool NoPin>
-  static MemTableRep::Iterator* MakeIter(OffsetSkipListRepT* tab, Arena* a) {
+  static MemTableRep::Iterator* MakeIter(OffsetSkipListRepT* tab, Arena* a,
+                                         uint32_t head = OffsetSL::nil) {
     if (tab->max_visible_seq_ != kMaxSequenceNumber) {
       using It = VisibleIter<Entry, NoPin>;
       void* mem = a ? a->AllocateAligned(sizeof(It)) : operator new(sizeof(It));
-      return new (mem) It(*tab);
+      return new (mem) It(*tab, head);
     }
     using It = Iter<Entry, NoPin>;
     void* mem = a ? a->AllocateAligned(sizeof(It)) : operator new(sizeof(It));
-    return new (mem) It(*tab);
+    return new (mem) It(*tab, head);
   }
 
   template <bool NoPin>
-  MemTableRep::Iterator* MakeIterByEntry(Arena* arena) {
+  MemTableRep::Iterator* MakeIterByEntry(Arena* arena,
+                                         uint32_t head = OffsetSL::nil) {
     if (ref_to_wal_ == OSLLogRefFormat::kPlainLogRef) {
-      return MakeIter<KeyValueToLogRef, NoPin>(this, arena);
+      return MakeIter<KeyValueToLogRef, NoPin>(this, arena, head);
     }
     if (ref_to_wal_ == OSLLogRefFormat::kShortLogRef) {
-      return MakeIter<KV_ToShortLogRef, NoPin>(this, arena);
+      return MakeIter<KV_ToShortLogRef, NoPin>(this, arena, head);
     }
-    return MakeIter<KeyValueToMemRef, NoPin>(this, arena);
+    return MakeIter<KeyValueToMemRef, NoPin>(this, arena, head);
+  }
+
+  MemTableRep::Iterator* GetIteratorAt(Arena* arena, uint32_t head) final {
+    if (!skip_list_.need_pin()) {
+      return MakeIterByEntry<true>(arena, head);
+    }
+    return MakeIterByEntry<false>(arena, head);
   }
 
   MemTableRep::Iterator* GetIterator(Arena* arena = nullptr) override {
-    if (!skip_list_.need_pin()) {
-      return MakeIterByEntry<true>(arena);
-    }
-    return MakeIterByEntry<false>(arena);
+    return GetIteratorAt(arena, sl_head_loc());
   }
 };
 
@@ -1865,6 +1996,37 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
     tab.wals_ = rh->wals;
     tab.num_wals_ = as_atomic(rh->num_wals).load(std::memory_order_acquire);
     MemTableRepStats::Recover(base, rh->stats_head, meta, tab.wals_, tab.num_wals_);
+    tab.m_range_del_head_ = rh->range_del_head;
+    tab.m_range_del_cnt_ = tab.CountHead(rh->range_del_head);
+    if (const uint64_t num_range_dels = tab.m_range_del_cnt_) {
+      // Visible range end keys can be WAL refs too. Recovery needs their bytes
+      // for file boundaries, before the table reader opens the blob links.
+      for (size_t i = 0; i < tab.num_wals_; ++i) {
+        const auto wal_no = tab.wals_[i].fileno;
+        const auto wal_path = LogFileName(tboptions.ioptions.GetWalDir(), wal_no);
+        auto [wal, ios] =
+            ReadonlyFileMmap::New(*tboptions.ioptions.fs, wal_no, wal_path);
+        if (!ios.ok()) {
+          return ios;
+        }
+        // Transfer this reference to tab; its destructor releases every map,
+        // including maps opened before a later slot fails to open.
+        tab.walmaps_[i] = wal.detach();
+      }
+      // NOTE:
+      //   1. RangeDel cnt and num_entries disagree: the former must be exact,
+      //      the latter is not: exact num_entries would need a pubseq scan
+      //      over the KVs, of which there can be very many, a trade off.
+      //      The RangeDels are few, so counting them is cheap, and it spares
+      //      the upper layers from adapting to an inexact RangeDel cnt
+      //   2. MemTable's RangeDel cnt and TableReader's disagree: the former
+      //      counts the tombstones on insert, the latter has no insert
+      meta->num_range_deletions = num_range_dels;
+      meta->num_deletions += num_range_dels;
+    } else {
+      tab.m_range_del_head_ = 0;
+      tab.m_range_del_cnt_ = 0;
+    }
     Status s = tab.ConvertToSSTImpl(meta, tboptions);
     TEST_SYNC_POINT_CALLBACK("CrashSafeRecover::ConvertToSST:InjectStatus", &s);
     TEST_SYNC_POINT("CrashSafeRecover::AfterConvertBeforeAddFile");
@@ -1900,7 +2062,7 @@ Status OffsetSkipListRep::ConvertToSSTImpl(FileMetaData* meta, const TableBuilde
   {
     std::unique_ptr<MemTableRep::Iterator> probe(GetIterator(nullptr));
     probe->SeekToFirst();
-    if (!probe->Valid()) {
+    if (!probe->Valid() && 0 == m_range_del_cnt_) {
       return Status::OK();
     }
   }
@@ -2027,17 +2189,25 @@ Status OffsetSkipListRep::ConvertToSSTImpl(FileMetaData* meta, const TableBuilde
   double t3 = clock->NowMicros();
   std::unique_ptr<MemTableRep::Iterator> iter(GetIterator(nullptr));
   iter->SeekToFirst();
-  if (!iter->Valid()) {
-    return fail_after_open(
-        Status::InvalidArgument("OffsetSkipList ConvertToSST: empty"));
+  if (iter->Valid()) {  // false when the memtable holds only range deletions
+    meta->smallest.DecodeFrom(iter->key());
+    iter->SeekToLast();
+    meta->largest.DecodeFrom(iter->key());
   }
-  meta->smallest.DecodeFrom(iter->key());
-  iter->SeekToLast();
-  if (!iter->Valid()) {
-    return fail_after_open(
-        Status::InvalidArgument("OffsetSkipList ConvertToSST: empty"));
+  // Range deletions are in this file too, with the same visibility as the
+  // keys above: a pubseq hidden one must not extend the file's range. Their
+  // end key is exclusive, carrying kMaxSequenceNumber as SerializeEndKey().
+  if (m_range_del_cnt_) {
+    std::unique_ptr<MemTableRep::Iterator> rd(GetRangeDelIterator(nullptr));
+    for (rd->SeekToFirst(); rd->Valid(); rd->Next()) {
+      const Slice ikey = rd->key();
+      const SequenceNumber seq = GetInternalKeySeqno(ikey);
+      meta->UpdateBoundariesForRange(
+          InternalKey(ExtractUserKey(ikey), seq, kTypeRangeDeletion),
+          InternalKey(rd->value(), kMaxSequenceNumber, kTypeRangeDeletion), seq,
+          tbo.internal_comparator);
+    }
   }
-  meta->largest.DecodeFrom(iter->key());
   meta->fd.file_size = writer.GetFileSize();
   meta->tail_size = builder.GetTailSize();
   if (!tbo.db_id.empty() && !tbo.db_session_id.empty()) {
@@ -2103,7 +2273,7 @@ class OffsetSkipListTableFactory : public TableFactory {
                          const ColumnFamilyOptions&) const final {
     return Status::OK();
   }
-  bool IsDeleteRangeSupported() const override { return false; }
+  bool IsDeleteRangeSupported() const override { return true; }
   void Update(const json& q, const json& js, const SidePluginRepo& repo) {
     memtable_factory->Update(q, js, repo);
     ROCKSDB_JSON_OPT_PROP(js, populate_read);
@@ -2119,7 +2289,11 @@ class OffsetSkipListTableFactory : public TableFactory {
 
 class OffsetSkipListTableReader : public TopTableReaderBase {
  public:
-  ~OffsetSkipListTableReader() override = default;
+  ~OffsetSkipListTableReader() override {
+    // fragmented_range_dels_ holds an iterator over memtab_'s range deletion
+    // list, and its destructor deletes that iterator, so it must go first
+    fragmented_range_dels_.reset();
+  }
   OffsetSkipListTableReader(RandomAccessFileReader*, Slice file_data,
                             const TableReaderOptions&,
                             const OffsetSkipListTableFactory*);
@@ -2303,6 +2477,15 @@ OffsetSkipListTableReader::OffsetSkipListTableReader(
       reinterpret_cast<const OffsetSkipListMeta*>(meta_bc.data.data());
   TERARK_VERIFY_EQ(sst_meta->version, kMetaVersion);
   TERARK_VERIFY_GE(file_data.size(), sst_meta->mem_used);
+  // The file starts with the header of the pool it holds, in both convert
+  // kinds: kFileMmap's file is the memtable's own pool, and a dumped pool is
+  // written with the header it carries. The range deletion head is in it.
+  const auto* hdr =
+      reinterpret_cast<const terark::OSL_MmapHeader*>(file_data.data());
+  const bool hdr_ok =
+      file_data.size() >= sizeof(*hdr) &&
+      memcmp(hdr->magic, terark::kOSLMmapHeaderMagic,
+             sizeof(terark::kOSLMmapHeaderMagic) - 1) == 0;
   memtab_.reset(NewOSLRepAttach(
       tro.ioptions.user_comparator, sst_meta,
       const_cast<byte_t*>(reinterpret_cast<const byte_t*>(file_data.data())),
@@ -2369,6 +2552,21 @@ OffsetSkipListTableReader::OffsetSkipListTableReader(
     compression_options += std::to_string(memtab_->max_visible_seq_);
   }
   memtab_->FillTableProperties(table_properties_.get());
+  if (auto range_del_cnt = table_properties_->num_range_deletions) {
+    // The count comes from TableProperties and the head from the file header,
+    // the only place a conversion persists it: the two are together or neither.
+    TERARK_VERIFY(hdr_ok);
+    memtab_->m_range_del_head_ = RepHdr(hdr)->range_del_head;
+    memtab_->m_range_del_cnt_ = static_cast<uint32_t>(range_del_cnt);
+    // must stay below the LogRef: parse above, the end keys are log refs
+    std::unique_ptr<MemTableRep::Iterator> rd(
+        memtab_->GetRangeDelIterator(nullptr));
+    rd->SeekToFirst();
+    if (rd->Valid()) {
+      fragmented_range_dels_ = std::make_shared<FragmentedRangeTombstoneList>(
+          std::move(rd), tro.internal_comparator);
+    }
+  }
   factory_ = f;
 }
 

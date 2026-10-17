@@ -431,41 +431,6 @@ class OffsetSkipListRep : public MemTableRep {
   uint32_t m_range_del_head_ = 0;  // atomic, allocated lazily, rd is rare
   uint32_t m_range_del_cnt_ = 0;   // atomic, rd is rare
 
-  size_t add_wal(size_t fileno, const ReadonlyFileMmap* wal) {
-    TERARK_ASSERT_NE(fileno, 0);
-    size_t i = 0;
-    while (i < num_wals_) {
-      if (LIKELY(wals_[i].fileno == fileno)) {
-        TERARK_ASSERT_EQ(walmaps_[i], wal);
-        return i;
-      }
-      i++;
-    }
-    std::lock_guard<std::mutex> lk(wal_mtx_);
-    while (i < num_wals_) {
-      if (wals_[i].fileno == fileno) {
-        TERARK_VERIFY_EQ(walmaps_[i], wal);
-        return i;
-      }
-      i++;
-    }
-    TERARK_VERIFY_LT(num_wals_, MAX_WALS);
-    wals_[i].cnt = 0;
-    walmaps_[i] = wal;
-    wals_[i].bytes = 0;
-    wals_[i].fileno = fileno;
-    as_atomic(num_wals_).fetch_add(1);
-    intrusive_ptr_add_ref(const_cast<ReadonlyFileMmap*>(wal));
-    // A process can crash inside the critical section, before mutex unlock.
-    // Only compiler reordering needs to be prevented here, but there is no
-    // corresponding standard way to express this, so use the stronger
-    // memory_order_release.
-    TERARK_VERIFY_NE(m_pool_header, nullptr);
-    as_atomic(RepHdr(m_pool_header)->num_wals)
-        .store(static_cast<uint32_t>(num_wals_), std::memory_order_release);
-    return i;
-  }
-
   void FillMeta(OffsetSkipListMeta* m) const {
     memset(m, 0, sizeof(*m));
     m->version = kMetaVersion;
@@ -645,6 +610,10 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     uint64_t pending_cnt_ = 0;
     uint64_t pending_bytes_ = 0;
     bool stats_on_heap_ = false;  // see ~Token
+    // The first entry of a node that then lost the insert race was counted by
+    // add_wal(): the entry the duplicate insert writes is the same value in
+    // the same slot, so it is paid for. Reset when an insert starts.
+    bool paid_wal_entry_ = false;
 
     Token(OffsetSkipListRepT* tab, typename OffsetSL::MemTls* tc) {
       // MarkReadOnly() shrinks the mempool (set_readonly() unmaps its free
@@ -816,13 +785,66 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       }
     });
   }
-  template <class Entry>
-  void AccountWal(Token* tok, size_t fidx, size_t valsize) {
-    // Only WAL-ref values are accounted: InsertKVTpl has made a token.
+  // Account the entry in its slot before publishing the slot: recovery trusts
+  // every published slot to already have its token statistics.
+  size_t add_wal(size_t fileno, const ReadonlyFileMmap* wal, Token* tok,
+                 size_t valsize) {
+    TERARK_ASSERT_NE(fileno, 0);
     TERARK_ASSERT_NE(tok, nullptr);
-    auto& x = tok->stats_->wals[fidx];
-    x.cnt++;
-    x.bytes += valsize;
+    auto* stats = tok->stats_;
+    TERARK_ASSERT_NE(stats, nullptr);
+    size_t i = 0;
+    while (i < num_wals_) {
+      if (LIKELY(wals_[i].fileno == fileno)) {
+        TERARK_ASSERT_EQ(walmaps_[i], wal);
+        if (UNLIKELY(tok->paid_wal_entry_)) {
+          return i;
+        }
+        stats->wals[i].cnt++;
+        stats->wals[i].bytes += valsize;
+        return i;
+      }
+      i++;
+    }
+    std::lock_guard<std::mutex> lk(wal_mtx_);
+    while (i < num_wals_) {
+      if (wals_[i].fileno == fileno) {
+        TERARK_VERIFY_EQ(walmaps_[i], wal);
+        if (UNLIKELY(tok->paid_wal_entry_)) {
+          return i;
+        }
+        stats->wals[i].cnt++;
+        stats->wals[i].bytes += valsize;
+        return i;
+      }
+      i++;
+    }
+    TERARK_ASSERT_EQ(tok->paid_wal_entry_, false);
+    TERARK_VERIFY_LT(num_wals_, MAX_WALS);
+    stats->wals[i].cnt = 1;
+    stats->wals[i].bytes = valsize;
+    wals_[i].cnt = 0;
+    walmaps_[i] = wal;
+    wals_[i].bytes = 0;
+    wals_[i].fileno = fileno;
+    as_atomic(num_wals_).fetch_add(1);
+    intrusive_ptr_add_ref(const_cast<ReadonlyFileMmap*>(wal));
+    // A process can crash inside the critical section, before mutex unlock.
+    // Only compiler reordering needs to be prevented here, but there is no
+    // corresponding standard way to express this, so use the stronger
+    // memory_order_release.
+    TERARK_VERIFY_NE(m_pool_header, nullptr);
+    as_atomic(RepHdr(m_pool_header)->num_wals)
+        .store(static_cast<uint32_t>(num_wals_), std::memory_order_release);
+    return i;
+  }
+
+  template <class Entry>
+  void AccountWal(Token* tok, size_t valsize) {
+    // Only WAL-ref values are accounted: InsertKVTpl has made a token.
+    // The slot was already accounted by add_wal(); this adds the token's
+    // pending totals, which are flushed to cached_wal_bytes_.
+    TERARK_ASSERT_NE(tok, nullptr);
     constexpr size_t kWalTlsFlushBytes = 512 * 1024;
     tok->pending_cnt_++;
     tok->pending_bytes_ += valsize;
@@ -849,8 +871,8 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     if (valsize <= sizeof(static_cast<Entry*>(nullptr)->value)) {
       return;
     }
-    auto fidx = add_wal(kv_pmt->fileno, kv_pmt->wal_file);
-    AccountWal<Entry>(tok, fidx, valsize);
+    // The slot was accounted when the node's entry was written.
+    AccountWal<Entry>(tok, valsize);
   }
 
   template <class Entry>
@@ -869,9 +891,9 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       memcpy(entry->value, kv_pmt->value.data_, valsize);
       entry->inline_val_len = valsize;
     } else {
-      auto fidx = add_wal(kv_pmt->fileno, kv_pmt->wal_file);
+      auto fidx = add_wal(kv_pmt->fileno, kv_pmt->wal_file, tok, valsize);
       if (account) {
-        AccountWal<Entry>(tok, fidx, valsize);
+        AccountWal<Entry>(tok, valsize);
       }
       entry->wal_idx = fidx;
       if constexpr (std::is_same_v<Entry, KeyValueToLogRef>) {
@@ -911,10 +933,12 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     }
   }
 
+  // The entry itself is written by the caller from the insert's on_new_key
+  // hook: only then is the key known to be new, and until then the node is
+  // unreachable, so it holds nothing a reader could observe.
   template <class Entry>
-  char* AllocNewNode(Slice ukey, uint64_t tag, Slice val, Token* tok,
-                     typename OffsetSL::MemTls* tc, size_t val_leading,
-                     size_t key_bytes) {
+  char* AllocNewNode(Slice ukey, typename OffsetSL::MemTls* tc,
+                     size_t val_leading, size_t key_bytes) {
     const size_t entry_off_in_key = key_bytes - sizeof(Entry);
     char* p = skip_list_.AllocateKey(key_bytes, tc, val_leading);
     TERARK_VERIFY_S(p != nullptr, "OffsetSkipList OOM: mem_cap=%zd",
@@ -928,9 +952,6 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     TERARK_ASSERT_AL(entry_off, kAlign);
     vec->pos = uint32_t(entry_off / kAlign);
     vec->num = 1;
-    const size_t vpos =
-        val_leading ? skip_list_.KeyAllocPos(p, val_leading) : 0;
-    WriteFirstEntry(e, tag, val, vpos, tok);
     return p;
   }
 
@@ -1068,6 +1089,9 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
                  ref_to_wal_ != OSLLogRefFormat::kNoLogRef)) {
       tok = GetToken(tc);
     }
+    if (tok) {
+      tok->paid_wal_entry_ = false;
+    }
     auto* stats = m_convert_to_sst == ConvertKind::kFileMmap ? tok->stats_ : nullptr;
     auto account_stats = [&]() {
       if (stats) {
@@ -1083,23 +1107,39 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     };
     const size_t val_leading = ValueLeadingSize<Entry>(val);
     const size_t key_bytes = KeyPayloadSize<Entry>(ukey);
-    char* node = AllocNewNode<Entry>(ukey, tag, val, tok, tc, val_leading,
-                                     key_bytes);
+    char* node = AllocNewNode<Entry>(ukey, tc, val_leading, key_bytes);
+    // The first entry is written from the insert's on_new_key hook: once the
+    // user key is known to be absent, before the node is linked. A linked
+    // node must already carry its entry, and add_wal(), which may publish a
+    // slot, must not run for a node that turns out to be a duplicate.
+    // InsertDup() writes an entry only after tag.seq is known to be new, as
+    // CSPP does; an entry is written and then thrown away only when the
+    // insert loses a race to a concurrent insert of the same user key, which
+    // CSPP's trie accepts too when it destroys a racing value.
+    const size_t vpos =
+        val_leading ? skip_list_.KeyAllocPos(node, val_leading) : 0;
+    auto* entry = reinterpret_cast<Entry*>(node + key_bytes - sizeof(Entry));
+    bool wrote_entry = false;
+    auto write_first_entry = [&] {
+      WriteFirstEntry<Entry>(entry, tag, val, vpos, tok);
+      wrote_entry = true;
+    };
     char* exist;
     if (head != OffsetSL::nil) {  // a range-del head from NewHead()
       TERARK_ASSERT_EQ(hint, nullptr);
-      exist = skip_list_.InsertAt(head, node, tc);
+      exist = skip_list_.InsertAt(head, node, tc, write_first_entry);
     } else if (hint != nullptr) {
       if constexpr (Concurrent) {
-        exist = skip_list_.InsertWithHintConcurrently(node, tc);
+        exist = skip_list_.InsertWithHintConcurrently(node, tc,
+                                                      write_first_entry);
       } else {
-        exist = skip_list_.InsertWithHint(node, tc);
+        exist = skip_list_.InsertWithHint(node, tc, write_first_entry);
       }
     } else {
       if constexpr (Concurrent) {
-        exist = skip_list_.InsertConcurrently(node, tc);
+        exist = skip_list_.InsertConcurrently(node, tc, write_first_entry);
       } else {
-        exist = skip_list_.Insert(node, tc);
+        exist = skip_list_.Insert(node, tc, write_first_entry);
       }
     }
     if (LIKELY(exist == nullptr)) {
@@ -1109,12 +1149,24 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       }
       return true;
     }
+    // The user key exists, so this node stays unlinked: keep its leading
+    // value only if the hook got to write it, and reuse that one.
     size_t reuse_vpos = size_t(-1);
-    if (val_leading) {
+    if (val_leading && wrote_entry) {
       reuse_vpos = skip_list_.FreeUnusedKeyKeepLeading(node, key_bytes,
                                                        val_leading, tc);
     } else {
-      skip_list_.FreeUnusedKey(node, key_bytes, tc);
+      skip_list_.FreeUnusedKey(node, key_bytes, tc, val_leading);
+    }
+    if (wrote_entry) {
+      if constexpr (!std::is_same_v<Entry, KeyValueToMemRef>) {
+        if (val.size()) {
+          auto* kv = reinterpret_cast<const KeyValuePassMemTable*>(val.data());
+          if (kv->value.size_ > sizeof(entry->value)) {
+            tok->paid_wal_entry_ = true;
+          }
+        }
+      }
     }
     const bool dup_ok = InsertDup<Entry>(exist, tag, val, tok, tc, reuse_vpos);
     if (dup_ok) {
@@ -2174,9 +2226,7 @@ Status OffsetSkipListRep::ConvertToSSTImpl(FileMetaData* meta, const TableBuilde
           return fail_after_open(ios);
         }
         oss | blob_no | ":" | e.fileno | ":" | e.cnt | ":" | e.bytes | ",";
-        auto cnt = std::max<uint64_t>(e.cnt, 1);  // TLS counts can lag after a crash.
-        auto bytes = std::max<uint64_t>(e.bytes, 1);  // Keep a positive blob size.
-        tbo.add_blob_file({blob_no, cnt, bytes, "", ""});
+        tbo.add_blob_file({blob_no, e.cnt, e.bytes, "", ""});
         terark::minimize(meta->oldest_blob_file_number, blob_no);
       }
       oss.pop_back();

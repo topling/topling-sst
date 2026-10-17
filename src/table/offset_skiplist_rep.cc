@@ -587,20 +587,24 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
 
   OffsetSkipListRepT(const Comparator* ucmp, Allocator* allocator,
                      const SliceTransform* transform, const size_t lookahead,
-                     size_t mem_cap, OffsetSkipListFactory* fac, Logger* log,
+                     size_t mem_cap, size_t chunk_size,
+                     OffsetSkipListFactory* fac, Logger* log,
                      ConvertKind convert)
       : OffsetSkipListRep(allocator, ucmp, transform, lookahead, fac, log,
                           convert),
-        skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem_cap) {}
+        skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem_cap,
+                   /*max_height=*/14, /*branching_factor=*/4, chunk_size) {}
 
   OffsetSkipListRepT(const Comparator* ucmp, Allocator* allocator,
                      const SliceTransform* transform, const size_t lookahead,
-                     size_t mem_cap, OffsetSkipListFactory* fac, Logger* log,
+                     size_t mem_cap, size_t chunk_size,
+                     OffsetSkipListFactory* fac, Logger* log,
                      const std::string& mmap_path)
       : OffsetSkipListRep(allocator, ucmp, transform, lookahead, fac, log,
                           ConvertKind::kFileMmap),
         skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem_cap, mmap_path,
-                   OSLTypedefName<SliceCmp>::value) {}
+                   OSLTypedefName<SliceCmp>::value, /*max_height=*/14,
+                   /*branching_factor=*/4, chunk_size) {}
 
   ~OffsetSkipListRepT() override {
     FlushAllWalTls();
@@ -1655,6 +1659,7 @@ OffsetSkipListRep* NewOSLRepAttach(const Comparator* uc,
 struct OffsetSkipListFactory final : public MemTableRepFactory {
   size_t lookahead = 0;
   size_t mem_cap = 2LL << 30;
+  size_t chunk_size = 0;  // 0 keeps the mempool's default
   OSLLogRefFormat log_ref_format = OSLLogRefFormat::kShortLogRef;
   bool token_use_idle = true;
   bool enable_gc = true;
@@ -1696,8 +1701,8 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
       ::close(fd);
       OffsetSkipListRep* r;
       try {
-        r = NewOSLRep(uc, allocator, transform, lookahead, cap, this,
-                      logger, path);
+        r = NewOSLRep(uc, allocator, transform, lookahead, cap, chunk_size,
+                      this, logger, path);
       } catch (...) {
         ::unlink(path.c_str());
         throw;
@@ -1705,8 +1710,8 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
       r->BindFactoryTokenOpts();
       return r;
     }
-    auto* r = NewOSLRep(uc, allocator, transform, lookahead, cap, this, logger,
-                        convert);
+    auto* r = NewOSLRep(uc, allocator, transform, lookahead, cap, chunk_size,
+                        this, logger, convert);
     r->BindFactoryTokenOpts();
     return r;
   }
@@ -1727,6 +1732,9 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
     }
     ROCKSDB_JSON_OPT_PROP(js, lookahead);
     ROCKSDB_JSON_OPT_SIZE(js, mem_cap);
+    ROCKSDB_JSON_OPT_SIZE(js, chunk_size);
+    ROCKSDB_VERIFY_F((chunk_size & (chunk_size - 1)) == 0, "%zd(%#zX)",
+                     chunk_size, chunk_size);
     ROCKSDB_JSON_OPT_ENUM(js, log_ref_format);
     ROCKSDB_JSON_OPT_PROP(js, token_use_idle);
     ROCKSDB_JSON_OPT_PROP(js, enable_gc);
@@ -1743,6 +1751,7 @@ struct OffsetSkipListFactory final : public MemTableRepFactory {
     json djs;
     ROCKSDB_JSON_SET_PROP(djs, lookahead);
     ROCKSDB_JSON_SET_SIZE(djs, mem_cap);
+    ROCKSDB_JSON_SET_SIZE(djs, chunk_size);
     ROCKSDB_JSON_SET_ENUM(djs, log_ref_format);
     ROCKSDB_JSON_SET_ENUM(djs, convert_to_sst);
     ROCKSDB_JSON_SET_PROP(djs, token_use_idle);

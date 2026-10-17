@@ -283,8 +283,6 @@ class OffsetSkipListRep : public MemTableRep {
   virtual const std::string& sl_mmap_fpath() const = 0;
   virtual fstring sl_get_mmap() const = 0;
   virtual void sl_set_readonly() = 0;
-  virtual terark::OSL_MmapHeader* sl_mmap_header() { return nullptr; }
-  virtual const char* sl_class_name() const = 0;
   virtual void sl_risk_bind_mmap(intptr_t, std::string, size_t) {}
   virtual bool sl_is_gc_enabled() const = 0;
   virtual uint64_t sl_slow_exact_num_nodes() const = 0;
@@ -400,6 +398,10 @@ class OffsetSkipListRep : public MemTableRep {
   // two must be serialized, see MarkReadOnly() and Token::Token().
   mutable std::mutex m_mtx_mark_readonly;
   bool m_has_marked_readonly = false;
+  // The header of the pool this rep created, at the pool's first bytes. Null
+  // for a rep that wraps bytes it does not own, a table reader or a crash safe
+  // recovery: that header belongs to whoever wrote the bytes.
+  terark::OSL_MmapHeader* m_pool_header = nullptr;
 
   size_t add_wal(size_t fileno, const ReadonlyFileMmap* wal) {
     TERARK_ASSERT_NE(fileno, 0);
@@ -426,16 +428,13 @@ class OffsetSkipListRep : public MemTableRep {
     wals_[i].fileno = fileno;
     as_atomic(num_wals_).fetch_add(1);
     intrusive_ptr_add_ref(const_cast<ReadonlyFileMmap*>(wal));
-    if (auto* h = sl_mmap_header()) {
-      TERARK_VERIFY_EQ(m_convert_to_sst, ConvertKind::kFileMmap);
-      auto* rh = RepHdr(h);
-      // A process can crash inside the critical section, before mutex unlock.
-      // Only compiler reordering needs to be prevented here, but there is no
-      // corresponding standard way to express this, so use the stronger
-      // memory_order_release.
-      as_atomic(rh->num_wals).store(static_cast<uint32_t>(num_wals_),
-                                   std::memory_order_release);
-    }
+    // A process can crash inside the critical section, before mutex unlock.
+    // Only compiler reordering needs to be prevented here, but there is no
+    // corresponding standard way to express this, so use the stronger
+    // memory_order_release.
+    TERARK_VERIFY_NE(m_pool_header, nullptr);
+    as_atomic(RepHdr(m_pool_header)->num_wals)
+        .store(static_cast<uint32_t>(num_wals_), std::memory_order_release);
     return i;
   }
 
@@ -549,16 +548,19 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       // tail), and must not run concurrently with the stats allocation below,
       // otherwise the allocated block may lie in the just unmapped tail.
       std::lock_guard<std::mutex> lk(tab->m_mtx_mark_readonly);
-      if (auto* hdr = tab->sl_mmap_header();
-          hdr != nullptr && !tab->m_has_marked_readonly) {
-        TERARK_VERIFY_EQ(tab->m_convert_to_sst, ConvertKind::kFileMmap);
+      // Only a file mmap memtable keeps its stats in its pool: a crash reads
+      // them back from the pool file. A dumped memtable has no such recovery,
+      // its stats stay on the heap and FlushAllWalTls() sums them.
+      if (tab->m_pool_header != nullptr && tab->skip_list_.is_mmap() &&
+          !tab->m_has_marked_readonly) {
         size_t pos = tab->skip_list_.tls_alloc(
             sizeof(MemTableRepStats) + alignof(MemTableRepStats) - kAlign, tc);
         TERARK_VERIFY_NE(pos, size_t(-1));
         pos = terark::pow2_align_up(pos, alignof(MemTableRepStats));
         TERARK_VERIFY_LE(pos / kAlign, UINT32_MAX);
         stats_ = MemTableRepStats::Link(
-            tab->base(), uint32_t(pos / kAlign), RepHdr(hdr)->stats_head);
+            tab->base(), uint32_t(pos / kAlign),
+            RepHdr(tab->m_pool_header)->stats_head);
       } else {
         // not file mmap, or the memtable has been marked readonly, in both
         // cases the mempool must not be used (after MarkReadOnly() no more
@@ -614,8 +616,15 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
                      ConvertKind convert)
       : OffsetSkipListRep(allocator, ucmp, transform, lookahead, fac, log,
                           convert),
+        // The class name stamps the pool with its own header, which a dump of
+        // the pool then carries. 14 and 4 are the ADT's defaults, spelled out
+        // because the class name comes after them.
         skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem_cap,
-                   /*max_height=*/14, /*branching_factor=*/4, chunk_size) {}
+                   /*max_height=*/14, /*branching_factor=*/4,
+                   OSLTypedefName<SliceCmp>::value, chunk_size) {
+    m_pool_header = skip_list_.header();
+    wals_ = RepHdr(m_pool_header)->wals;
+  }
 
   OffsetSkipListRepT(const Comparator* ucmp, Allocator* allocator,
                      const SliceTransform* transform, const size_t lookahead,
@@ -626,7 +635,10 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
                           ConvertKind::kFileMmap),
         skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem_cap, mmap_path,
                    OSLTypedefName<SliceCmp>::value, /*max_height=*/14,
-                   /*branching_factor=*/4, chunk_size) {}
+                   /*branching_factor=*/4, chunk_size) {
+    m_pool_header = skip_list_.header();
+    wals_ = RepHdr(m_pool_header)->wals;
+  }
 
   ~OffsetSkipListRepT() override {
     FlushAllWalTls();
@@ -635,9 +647,10 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
         intrusive_ptr_release(const_cast<ReadonlyFileMmap*>(wal));
       }
     }
-    num_wals_ = 0;  // skip_list_ destroys TLS tokens and unmaps the header next.
-    auto* h = skip_list_.mmap_header();
-    if (!h || wals_ != RepHdr(h)->wals) {
+    num_wals_ = 0;  // skip_list_ destroys TLS tokens and unmaps the pool next.
+    // A wrapping rep's wals_ is the heap array it made: everything else is the
+    // slots of the pool's own header.
+    if (wals_ != RepHdr(skip_list_.header())->wals) {
       delete[] wals_;
     }
   }
@@ -667,10 +680,6 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
   }
   fstring sl_get_mmap() const final { return skip_list_.get_mmap(); }
   void sl_set_readonly() final { skip_list_.set_readonly(); }
-  terark::OSL_MmapHeader* sl_mmap_header() final {
-    return skip_list_.mmap_header();
-  }
-  const char* sl_class_name() const final { return skip_list_.class_name(); }
   void sl_risk_bind_mmap(intptr_t fd, std::string path, size_t n) final {
     skip_list_.risk_bind_mmap(fd, std::move(path), n);
   }
@@ -1791,20 +1800,8 @@ void OffsetSkipListRep::BindFactoryTokenOpts() {
 
 void OffsetSkipListRep::InitSetMemTableAsLogIndex(bool b) {
   ref_to_wal_ = b ? fac_->log_ref_format : OSLLogRefFormat::kNoLogRef;
-  if (auto* h = sl_mmap_header()) {
-    TERARK_VERIFY_EQ(m_convert_to_sst, ConvertKind::kFileMmap);
-    memset(h, 0, sizeof(*h));
-    terark::InitOSLMmapHeaderIdentity(h, sl_class_name());
-    h->mem_used = sl_mem_size();
-    h->head_loc = sl_head_loc();
-    h->max_height = static_cast<uint8_t>(sl_max_height());
-    h->k_max_height = static_cast<uint8_t>(sl_k_max_height());
-    h->k_branching = static_cast<uint8_t>(sl_k_branching());
-    RepHdr(h)->log_ref = static_cast<uint32_t>(ref_to_wal_);
-    wals_ = RepHdr(h)->wals;
-  } else if (b) {
-    wals_ = new LogFileLookup[MAX_WALS]{};
-  }
+  TERARK_VERIFY_NE(m_pool_header, nullptr);
+  RepHdr(m_pool_header)->log_ref = static_cast<uint32_t>(ref_to_wal_);
 }
 
 Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
@@ -1886,8 +1883,7 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
 
 Status OffsetSkipListRep::ConvertToSST(FileMetaData* meta, const TableBuilderOptions& tbo) {
   if (m_convert_to_sst == ConvertKind::kFileMmap) {
-    TERARK_VERIFY_NE(sl_mmap_header(), nullptr);
-    auto* rh = RepHdr(sl_mmap_header());
+    auto* rh = RepHdr(m_pool_header);
     MemTableRepStats::Recover(base(), rh->stats_head, nullptr, wals_, num_wals_);
   }
   return ConvertToSSTImpl(meta, tbo);
@@ -1965,6 +1961,9 @@ Status OffsetSkipListRep::ConvertToSSTImpl(FileMetaData* meta, const TableBuilde
   OffsetSkipListTableBuilder builder(tbo, &writer);
   builder.SetMeta(sst_meta);
   if (!is_file_mmap) {
+    // The dumped pool goes out whole, its own header included: a converted file
+    // is the mempool the memtable held, so this is what a file mmap memtable of
+    // the same contents converts into, byte for byte, and no more.
     try {
       builder.DoWrite(
           Slice(reinterpret_cast<const char*>(sl_mem_data()), sl_mem_size()));
@@ -1974,9 +1973,6 @@ Status OffsetSkipListRep::ConvertToSSTImpl(FileMetaData* meta, const TableBuilde
     }
   }
   double t2 = clock->NowMicros();
-  if (!is_file_mmap) {
-    FlushAllWalTls();
-  }
   uint64_t total = 0;
   for (size_t i = 0; i < num_wals_; i++) {
     total += wals_[i].bytes;

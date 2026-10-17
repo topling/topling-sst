@@ -583,7 +583,8 @@ Status VecAutoSortTableBuilder::Finish() try {
     {{kStrVecIndex, WriteBlock(sstmeta.Memory(), file_, &offset_)}});
 
   auto fac = table_factory_;
-  auto ukey_len = properties_.raw_key_size - 8 * properties_.num_entries;
+  // Range deletions are not in the raw pools, so raw_* and num are both non-rd.
+  auto ukey_len = properties_.raw_key_size - 8 * num;
   long long t1 = g_pf.now();
   auto td = g_pf.us(t1 - t0);
   as_atomic(fac->sum_user_key_cnt_).fetch_add(num_user_key_, std::memory_order_relaxed);

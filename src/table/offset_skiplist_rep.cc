@@ -145,6 +145,8 @@ struct OSLRepHeader {
   // has no meta block yet, and the reader of a converted file takes it from the
   // same place for both convert kinds.
   uint32_t range_del_head;
+  // Exact user key count: range deletions and duplicate versions excluded.
+  uint64_t num_user_keys;
 };
 static_assert(sizeof(OSLRepHeader) <= sizeof(terark::OSL_MmapHeader::reserved));
 
@@ -424,9 +426,9 @@ class OffsetSkipListRep : public MemTableRep {
   // two must be serialized, see MarkReadOnly() and Token::Token().
   mutable std::mutex m_mtx_mark_readonly;
   bool m_has_marked_readonly = false;
-  // The header of the pool this rep created, at the pool's first bytes. Null
-  // for a rep that wraps bytes it does not own, a table reader or a crash safe
-  // recovery: that header belongs to whoever wrote the bytes.
+  // The header at the pool's first bytes. Every pool has one, allocated by
+  // this rep or wrapped; a wrapped pool is readonly, so nothing here writes
+  // its header.
   terark::OSL_MmapHeader* m_pool_header = nullptr;
   uint32_t m_range_del_head_ = 0;  // atomic, allocated lazily, rd is rare
   uint32_t m_range_del_cnt_ = 0;   // atomic, rd is rare
@@ -620,10 +622,11 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       // tail), and must not run concurrently with the stats allocation below,
       // otherwise the allocated block may lie in the just unmapped tail.
       std::lock_guard<std::mutex> lk(tab->m_mtx_mark_readonly);
-      // Only a file mmap memtable keeps its stats in its pool: a crash reads
-      // them back from the pool file. A dumped memtable has no such recovery,
-      // its stats stay on the heap and FlushAllWalTls() sums them.
-      if (tab->m_pool_header != nullptr && tab->skip_list_.is_mmap() &&
+      // Only a writable file mmap memtable keeps its stats in its pool: a
+      // crash reads them back from the pool file. A dumped or wrapped
+      // memtable has no such recovery, its stats stay on the heap and
+      // FlushAllWalTls() sums them.
+      if (tab->skip_list_.is_mmap() && !tab->skip_list_.is_readonly() &&
           !tab->m_has_marked_readonly) {
         size_t pos = tab->skip_list_.tls_alloc(
             sizeof(MemTableRepStats) + alignof(MemTableRepStats) - kAlign, tc);
@@ -733,7 +736,9 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
       : OffsetSkipListRep(nullptr, ucmp, nullptr, 0, fac, log,
                           ConvertKind::kFileMmap),
         skip_list_(UserKeyCmp<SliceCmp>{SliceCmp{ucmp}}, mem, head_loc,
-                   height_limit, current_height, branching, num_nodes) {}
+                   height_limit, current_height, branching, num_nodes) {
+    m_pool_header = skip_list_.header();
+  }
 
   byte_t* base() const final {
     return const_cast<byte_t*>(skip_list_.mem_data());
@@ -767,23 +772,31 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     tok->pending_bytes_ = 0;
   }
   void FlushAllWalTls() final {
-    if (m_convert_to_sst != ConvertKind::kFileMmap) {
-      for (size_t i = 0; i < num_wals_; i++) {
-        wals_[i].cnt = 0;
-        wals_[i].bytes = 0;
-      }
+    // A readonly pool's header belongs to whoever wrote the bytes: a table
+    // reader never finalizes, and crash recovery has already put the chain's
+    // totals there through MemTableRepStats::Recover(). MarkReadOnly() calls
+    // this before sl_set_readonly(), so a pool this rep writes finalizes
+    // while it is still writable, as CSPP's ConvertToReadOnly() does.
+    if (skip_list_.is_readonly()) {
+      return;
     }
-    skip_list_.for_each_tls_token([this](typename OffsetSL::Token* t) {
-      if (auto* w = dynamic_cast<Token*>(t)) {
-        ApplyWalToken(w);
-        if (m_convert_to_sst != ConvertKind::kFileMmap) {
-          for (size_t i = 0; i < num_wals_; i++) {
-            wals_[i].cnt += w->stats_->wals[i].cnt;
-            wals_[i].bytes += w->stats_->wals[i].bytes;
+    for (size_t i = 0; i < num_wals_; i++) {
+      wals_[i].cnt = 0;
+      wals_[i].bytes = 0;
+    }
+    uint64_t num_user_keys = 0;
+    skip_list_.for_each_tls_token(
+        [this, &num_user_keys](typename OffsetSL::Token* t) {
+          if (auto* w = dynamic_cast<Token*>(t)) {
+            ApplyWalToken(w);
+            num_user_keys += w->stats_->num_user_keys;
+            for (size_t i = 0; i < num_wals_; i++) {
+              wals_[i].cnt += w->stats_->wals[i].cnt;
+              wals_[i].bytes += w->stats_->wals[i].bytes;
+            }
           }
-        }
-      }
-    });
+        });
+    RepHdr(m_pool_header)->num_user_keys = num_user_keys;
   }
   // Account the entry in its slot before publishing the slot: recovery trusts
   // every published slot to already have its token statistics.
@@ -1085,16 +1098,15 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
         }
       }
     }
-    if (!tok && (m_convert_to_sst == ConvertKind::kFileMmap ||
-                 ref_to_wal_ != OSLLogRefFormat::kNoLogRef)) {
+    if (!tok) {
       tok = GetToken(tc);
     }
-    if (tok) {
-      tok->paid_wal_entry_ = false;
-    }
-    auto* stats = m_convert_to_sst == ConvertKind::kFileMmap ? tok->stats_ : nullptr;
+    tok->paid_wal_entry_ = false;
+    auto* stats = tok->stats_;
     auto account_stats = [&]() {
-      if (stats) {
+      // Only a FileMmap rep has a reader for these: Recover() walks the pooled
+      // stats chain. num_user_keys is counted on the token for every kind.
+      if (m_convert_to_sst == ConvertKind::kFileMmap) {
         size_t real_value_size = val.size();
         if constexpr (!std::is_same_v<Entry, KeyValueToMemRef>) {
           if (!val.empty()) {
@@ -1144,6 +1156,12 @@ class OffsetSkipListRepT final : public OffsetSkipListRep {
     }
     if (LIKELY(exist == nullptr)) {
       account_stats();
+      // A new key in a NewHead() list is a range deletion, not a user key;
+      // the branch above has already tested the same head, as CSPP tests
+      // root == initial_state.
+      if (head == OffsetSL::nil) {
+        stats->num_user_keys++;
+      }
       if constexpr (!std::is_same_v<Entry, KeyValueToMemRef>) {
         AccountFirstInsert<Entry>(val, tok);
       }
@@ -2047,7 +2065,13 @@ Status OffsetSkipListFactory::RecoverCrashSafeMemTableToSST(
     }
     tab.wals_ = rh->wals;
     tab.num_wals_ = as_atomic(rh->num_wals).load(std::memory_order_acquire);
+    // Recover parks num_user_keys in oldest_blob_file_number; move it into the
+    // crash-safe header and restore the old value right away, before
+    // ConvertToSSTImpl reuses the field.
+    const uint64_t oldest_blob_file_number = meta->oldest_blob_file_number;
     MemTableRepStats::Recover(base, rh->stats_head, meta, tab.wals_, tab.num_wals_);
+    rh->num_user_keys = meta->oldest_blob_file_number;
+    meta->oldest_blob_file_number = oldest_blob_file_number;
     tab.m_range_del_head_ = rh->range_del_head;
     tab.m_range_del_cnt_ = tab.CountHead(rh->range_del_head);
     if (const uint64_t num_range_dels = tab.m_range_del_cnt_) {

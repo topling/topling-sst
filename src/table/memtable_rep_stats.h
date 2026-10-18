@@ -18,6 +18,8 @@ struct alignas(8) MemTableRepStats {
   };
 
   uint64_t num_entries = 0;
+  // User keys only: range deletions and duplicate versions do not count.
+  uint64_t num_user_keys = 0;
   uint64_t num_deletions = 0;
   uint64_t num_merges = 0;
   uint64_t raw_key_size = 0;
@@ -62,6 +64,8 @@ struct alignas(8) MemTableRepStats {
       meta->num_merges = 0;
       meta->raw_key_size = 0;
       meta->raw_value_size = 0;
+      // Borrowed to carry num_user_keys out; the caller restores it.
+      meta->oldest_blob_file_number = 0;
     }
     for (size_t i = 0; i < num_wals; i++) {
       wals[i].cnt = 0;
@@ -76,6 +80,7 @@ struct alignas(8) MemTableRepStats {
         meta->num_merges += node->num_merges;
         meta->raw_key_size += node->raw_key_size;
         meta->raw_value_size += node->raw_value_size;
+        meta->oldest_blob_file_number += node->num_user_keys;
       }
       for (size_t i = 0; i < num_wals; i++) {
         wals[i].cnt += node->wals[i].cnt;

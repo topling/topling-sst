@@ -73,9 +73,11 @@ inline bool BytesEqualMaxLen16(const void* px, const void* py, size_t len) {
  #endif
 }
 
-inline bool BytesEqualMaxLen32(const void* px, const void* py, size_t len) {
-  TERARK_ASSERT_LE(len, 32);
+inline bool BytesEqOptMaxLen32(const void* px, const void* py, size_t len) {
  #if defined(__AVX512VL__) && defined(__AVX512BW__)
+  if (terark_unlikely(len > 32)) {
+    return memcmp(px, py, len) == 0;
+  }
   __mmask32 msk = _bzhi_u32(-1, uint32_t(len));
   __m256i   xxx = _mm256_maskz_loadu_epi8(msk, px);
   __m256i   yyy = _mm256_maskz_loadu_epi8(msk, py);
@@ -86,9 +88,11 @@ inline bool BytesEqualMaxLen32(const void* px, const void* py, size_t len) {
  #endif
 }
 
-inline bool BytesEqualMaxLen64(const void* px, const void* py, size_t len) {
-  TERARK_ASSERT_LE(len, 64);
+inline bool BytesEqOptMaxLen64(const void* px, const void* py, size_t len) {
  #if defined(__AVX512VL__) && defined(__AVX512BW__)
+  if (terark_unlikely(len > 64)) {
+    return memcmp(px, py, len) == 0;
+  }
   __mmask64 msk = _bzhi_u64(-1, len);
   __m512i   xxx = _mm512_maskz_loadu_epi8(msk, px);
   __m512i   yyy = _mm512_maskz_loadu_epi8(msk, py);
